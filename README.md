@@ -1,293 +1,134 @@
-# RAG Benchmarking: Multi-Strategy Retrieval for Multi-Hop QA
+# UIT DSC 2026 - LegalIR: RAPTOR + Knowledge Graph for Vietnamese Legal Retrieval
 
-[![Recall@10](https://img.shields.io/badge/MultiHop--RAG-72.89%25-brightgreen)](./docs/technical_report.md)
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![Legal Model](https://img.shields.io/badge/legal-Qwen3--4B--legal--pretrain-orange)](https://huggingface.co/VLSP2025-LegalSML/qwen3-4b-legal-pretrain)
 
-A complete RAG system that achieves **72.89% Recall@10** on MultiHop-RAG, surpassing RAPTOR's ~70%. This repository includes:
+> **Repo nộp bài:** `https://github.com/huynhnhatminh20/uit-dsc-2026-legal-raptor-KG` — nộp toàn bộ folder GitHub (Cách 2: notebook chỉ train & đọc KQ)
 
-- 🔧 **Full RAG Implementation** (`ultimate_rag/`) - RAPTOR + Graph + HyDE + BM25 + Neural Reranking
-- 📊 **Benchmark Suite** (`adapters/`, `scripts/`) - Evaluation harness for MultiHop-RAG, CRAG
-- 📝 **Documentation** (`docs/`) - Blog post, technical report, architecture
+Hệ thống truy vấn pháp luật tiếng Việt cho UIT Data Science Challenge 2026 - Task 1 LegalIR. Với một câu hỏi pháp luật, hệ thống trả về tối đa 05 `document_id` chứa thông tin cần thiết (đánh giá chính `Recall@5`, phụ `Precision@5`).
+
+> **Based on:** [incidentfox/OpenRag](https://github.com/incidentfox/OpenRag) — MIT License. Toàn bộ core RAPTOR, Vector Store, Knowledge Graph, Hybrid Retrieval được kế thừa từ OpenRag và điều chỉnh cho văn bản pháp luật tiếng Việt với Legal LLM.
 
 ---
 
-## Quick Start
+## Mô hình vận hành (Cách 2)
 
-### 1. Install Dependencies
+**GitHub là Source of Truth + Kaggle Notebook chỉ để Train & Đọc Kết Quả** — Leader không paste code.
 
+| Thành viên | Module trên GitHub | Nhiệm vụ |
+|------------|-------------------|----------|
+| **A** | `member_a.py` / `src/raptor/` | Chunk Điều→Khoản→Đoạn, build RAPTOR bằng Legal 4B, Vector Store `BAAI/bge-m3` → FAISS |
+| **B** | `member_b.py` / `src/graph/` | KG (Legal 4B → NetworkX), BM25, Hybrid RRF |
+| **C** | `member_c.py` / `src/reranker.py` | Wrapper Legal 4B 4-bit, `BAAI/bge-reranker-v2-m3` lọc top 5, `Recall@5/Precision@5` |
+
+Kaggle `notebook/train.ipynb` chỉ có 5 cell: `git clone` → `import member_a/b/c` → `train` → `rerank` → `submission.json`. Xem chi tiết trong `docs/huong dẫn.docx`.
+
+---
+
+## Quick Start (Leader trên Kaggle)
+
+### 1. Clone repo (trong Kaggle Notebook, Internet ON)
 ```bash
-# Clone the repo
-git clone https://github.com/incidentfox/OpenRag.git
-cd rag_benchmarking
+!rm -rf uit-dsc-2026-legal-raptor-KG
+!git clone https://github.com/huynhnhatminh20/uit-dsc-2026-legal-raptor-KG.git
+```
 
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install requirements
+### 2. Cài đặt
+```bash
 pip install -r requirements.txt
+# requirements chính: torch, transformers, accelerate, bitsandbytes, sentence-transformers, rank-bm25, networkx, faiss-cpu
 ```
 
-### 2. Set API Keys
+### 3. Thêm dataset LegalIR vào Kaggle
+Upload `data_legalir/` (33k văn bản, `train.json` 7000 query, `public-official.json` 1000 query) thành Kaggle Dataset riêng → Add Input vào notebook. Không push `data_legalir/` lên GitHub (vượt 100MB).
 
-```bash
-export OPENAI_API_KEY="sk-..."
-export COHERE_API_KEY="..."  # Optional but recommended for best performance
+### 4. Train & Inference (Leader Run All)
+```python
+import sys; sys.path.append('uit-dsc-2026-legal-raptor-KG')
+from member_a import build_raptor, build_vector_store
+from member_b import build_graph, build_bm25, hybrid_retrieve
+from member_c import LegalReranker
+
+build_raptor()        # A: checkpoint /kaggle/working/A_checkpoint/
+build_vector_store()  # A: FAISS
+build_graph()         # B: /kaggle/working/B_checkpoint/
+build_bm25()          # B
+reranker = LegalReranker().load()  # C: bge-reranker-v2-m3
+# for q in public-official.json: candidates = hybrid_retrieve(q); top5 = reranker.rerank(q, candidates)
 ```
 
-### 3. Start the RAG Server
+Output: `/kaggle/working/submission.json` → zip `submission.zip` (chỉ chứa `submission.json`).
 
-```bash
-cd ultimate_rag
-python -m api.server
-```
-
-Server runs at `http://localhost:8000`. Check health: `curl http://localhost:8000/health`
-
-### 4. Run Benchmark
-
-```bash
-# MultiHop-RAG (2556 queries)
-python scripts/run_multihop_eval.py --queries 100  # Quick test
-
-# Full benchmark
-python scripts/run_multihop_eval.py
-```
-
----
-
-## Results
-
-| Benchmark | Queries Tested | Our Result | SOTA | Notes |
-|-----------|----------------|------------|------|-------|
-| **MultiHop-RAG** | 2,556 (full) | **72.89%** | ~70% | Beats RAPTOR baseline |
-| **SQuAD** | 200+ (ongoing) | **99.0%** | ~85-90% | Full benchmark running on EC2 |
-| **CRAG** | 10 (sample) | **70%** | ~50-60% | Per-query corpus test |
-
-> **Note on SQuAD:** Full 10,570-query benchmark running on EC2. After 200 queries: 99.0% Recall@10.
-
-> **Note on CRAG:** Tested 10 queries using each query's provided search results as corpus. Scaling requires per-query ingestion which is compute-intensive. CRAG is designed for API-augmented RAG, not static document retrieval.
-
-### Ablation Study
-
-| Component | Recall@10 | Δ from baseline |
-|-----------|-----------|-----------------|
-| Semantic only | 55.2% | — |
-| + RAPTOR hierarchy | 62.5% | +7.3% |
-| + Cohere reranking | 71.8% | +16.6% |
-| + BM25 hybrid | 72.4% | +17.2% |
-| + HyDE + Query decomp | 72.89% | +17.7% |
-
-**Key insight:** Cohere's neural reranker alone adds +9.3 percentage points.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Query Input                              │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Parallel Retrieval Strategies                  │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │
-│  │ Semantic │ │   HyDE   │ │   BM25   │ │  Query   │           │
-│  │  Search  │ │ Expansion│ │  Hybrid  │ │  Decomp  │           │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘           │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Cohere Neural Reranking                       │
-│                  (rerank-english-v3.0)                           │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         Top-K Results                            │
-└─────────────────────────────────────────────────────────────────┘
+### 5. Đánh giá local
+```python
+from member_c import evaluate_recall_precision
+evaluate_recall_precision(gt_dict, pred_dict)  # Recall@5, Precision@5, ràng buộc >5 → 0
 ```
 
 ---
 
-## Repository Structure
+## Model chốt (bắt buộc dùng Legal)
+
+| Module | Model | Mục đích |
+|--------|-------|----------|
+| RAPTOR | `VLSP2025-LegalSML/qwen3-4b-legal-pretrain` (backup `luanngo/Qwen3-4B-VietNamese-Legal-Chat`) | Tóm tắt cụm chunk |
+| Embedding | `BAAI/bge-m3` | Dense retrieval, clustering |
+| Reranker | `BAAI/bge-reranker-v2-m3` | Chấm chéo [query, passage] → top 5 |
+| KG | Legal 4B + NetworkX | Trích thực thể pháp lý |
+| BM25 | `rank-bm25` | Khớp số hiệu điều luật |
+
+---
+
+## Cấu trúc repo khi nộp
 
 ```
-rag_benchmarking/
-├── ultimate_rag/              # 🔧 Full RAG implementation
-│   ├── api/
-│   │   └── server.py          # FastAPI server
-│   ├── retrieval/
-│   │   ├── retriever.py       # Main orchestration
-│   │   ├── strategies.py      # HyDE, BM25, decomposition
-│   │   └── reranker.py        # Cohere + cross-encoder
-│   ├── raptor/
-│   │   └── tree_building.py   # RAPTOR hierarchy
-│   ├── graph/
-│   │   └── graph.py           # Knowledge graph
-│   ├── core/
-│   │   └── node.py            # Tree/forest data structures
-│   └── agents/
-│       └── teaching.py        # Knowledge teaching interface
-│
-├── knowledge_base/            # 📚 RAPTOR core library
-│   └── raptor/
-│       ├── cluster_tree_builder.py
-│       ├── EmbeddingModels.py
-│       └── ...
-│
-├── adapters/                  # 🔌 Benchmark adapters
-│   └── ultimate_rag_adapter.py
-│
-├── scripts/                   # 🚀 Evaluation scripts
-│   ├── run_multihop_eval.py
-│   └── run_crag_eval.py
-│
-├── docs/                      # 📝 Documentation
-│   ├── blog_post.md           # Practitioner-friendly writeup
-│   ├── technical_report.md    # Academic-style report
-│   └── README.md
-│
-├── multihop_rag/              # 📊 MultiHop-RAG dataset
-│   └── dataset/
-│       ├── corpus.json        # 609 news articles
-│       └── MultiHopRAG.json   # 2556 queries
-│
-├── crag/                      # 📊 CRAG dataset
-│   └── ...
-│
-└── requirements.txt           # Dependencies
+uit-dsc-2026-legal-raptor-KG/
+├── README.md
+├── LICENSE (MIT - giữ nguyên từ OpenRag)
+├── requirements.txt
+├── member_a.py / src/raptor/    # A
+├── member_b.py / src/graph/     # B
+├── member_c.py / src/reranker.py # C
+├── notebook/train.ipynb         # Leader chạy (5 cell)
+├── docs/huong dẫn.docx          # Hướng dẫn Cách 2 đầy đủ
+└── submission.json              # Sinh ra sau train
 ```
 
 ---
 
-## API Endpoints
+## Quy trình Git cho team 3
 
-### Health Check
 ```bash
-curl http://localhost:8000/health
-```
-
-### Query (Retrieval)
-```bash
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What was the outcome of the merger?", "top_k": 10}'
-```
-
-### Ingest Documents
-```bash
-curl -X POST http://localhost:8000/ingest/batch \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tree": "default",
-    "documents": [{"content": "Document text here..."}],
-    "build_hierarchy": true
-  }'
-```
-
-### Save/Load Tree
-```bash
-# Save
-curl -X POST http://localhost:8000/persist/save \
-  -H "Content-Type: application/json" \
-  -d '{"tree": "default"}'
-
-# Load
-curl -X POST http://localhost:8000/persist/load \
-  -H "Content-Type: application/json" \
-  -d '{"tree": "default", "path": "trees/default.pkl"}'
+git checkout -b c/reranker  # mỗi người branch riêng
+# code member_c.py
+git add member_c.py && git commit -m "c: reranker" && git push origin c/reranker
+# tạo Pull Request trên GitHub → Leader merge vào main
+# Leader trên Kaggle: !git pull origin main → Run All
 ```
 
 ---
 
-## Configuration
+## License & Citation
 
-### Retrieval Modes
-
-| Mode | Strategies | Use Case |
-|------|------------|----------|
-| `fast` | Semantic only | Low latency, simple queries |
-| `standard` | Semantic + HyDE + BM25 + Decomp | Balanced (default) |
-| `thorough` | All strategies | Maximum recall, high latency |
-
-### Environment Variables
-
-```bash
-OPENAI_API_KEY=sk-...          # Required for embeddings
-COHERE_API_KEY=...             # Recommended for reranking (see privacy note below)
-RETRIEVAL_MODE=standard        # fast|standard|thorough
-DEFAULT_TOP_K=10               # Number of results
-```
-
-### Privacy Notice: Cohere Reranker
-
-This system uses [Cohere's rerank API](https://cohere.com/rerank) for neural reranking, which provides the best benchmark results (+9.3% improvement). **Please be aware:**
-
-- **Data logging:** By default, Cohere logs prompts and outputs on their SaaS platform (retained for 30 days)
-- **Training opt-out:** You can disable data usage for training in your [Cohere dashboard](https://dashboard.cohere.com/) under "Data Controls"
-- **Zero retention:** Enterprise customers can request zero data retention
-- **Cloud deployments:** If using Cohere via AWS/GCP/Azure, Cohere does not receive your data
-
-**For privacy-sensitive use cases**, consider these alternatives:
-
-1. **Local cross-encoder:** The system includes `CrossEncoderReranker` using `BAAI/bge-reranker-base` (runs locally, no external API)
-2. **Remove Cohere:** Don't set `COHERE_API_KEY` and the system falls back to local reranking
-3. **LLM-as-reranker:** Use a local/GDPR-compliant LLM for reranking
-
-See [Cohere's privacy policy](https://cohere.com/privacy) and [enterprise data commitments](https://cohere.com/enterprise-data-commitments) for details.
-
----
-
-## Cost Analysis
-
-| Component | Cost per Query |
-|-----------|----------------|
-| OpenAI embeddings | $0.000007 |
-| HyDE generation | $0.00018 |
-| Query decomposition | $0.00027 |
-| Cohere reranking | $0.002 |
-| **Total** | **~$0.0025** |
-
-Full benchmark (2556 queries): **~$6**
-
----
-
-## Documentation
-
-- 📝 [Blog Post](./docs/blog_post.md) - Practitioner-friendly writeup
-- 📊 [Technical Report](./docs/technical_report.md) - Detailed analysis with ablations
-- 🏗️ [Architecture](./ultimate_rag/ARCHITECTURE.md) - System design
-
----
-
-## Citation
-
-If you use this code, please cite:
+MIT License — see [LICENSE](./LICENSE). Original work by [incidentfox/OpenRag](https://github.com/incidentfox/OpenRag).
 
 ```bibtex
-@software{rag_benchmarking_2026,
+@software{openrag_2026,
   title = {Multi-Strategy RAG for Multi-Hop Question Answering},
-  author = {Anonymous},
+  author = {incidentfox},
   year = {2026},
   url = {https://github.com/incidentfox/OpenRag}
 }
+@software{legalir_2026,
+  title = {UIT DSC 2026 LegalIR - RAPTOR + KG with Legal LLM},
+  author = {huynhnhatminh20},
+  year = {2026},
+  url = {https://github.com/huynhnhatminh20/uit-dsc-2026-legal-raptor-KG}
+}
 ```
 
----
-
-## License
-
-MIT License - see [LICENSE](./LICENSE) for details.
-
----
-
 ## Acknowledgments
-
-- [RAPTOR](https://arxiv.org/abs/2401.18059) for hierarchical retrieval
-- [Cohere](https://cohere.com) for neural reranking API
-- [MultiHop-RAG](https://github.com/yixuantt/MultiHop-RAG) for benchmark dataset
-- Built with [Claude](https://anthropic.com) as AI pair programmer
+- [RAPTOR](https://arxiv.org/abs/2401.18059), [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3), [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)
+- [VLSP2025-LegalSML/qwen3-4b-legal-pretrain](https://huggingface.co/VLSP2025-LegalSML/qwen3-4b-legal-pretrain)
+- Built on [OpenRag](https://github.com/incidentfox/OpenRag)
