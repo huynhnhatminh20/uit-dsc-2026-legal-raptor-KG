@@ -40,3 +40,8 @@ Thumbs.db
 
 # LFS (don't use)
 .gitattributes
+
+# Local large data - not pushed to GitHub
+data_legalir/
+uit-dsc-2026-legal-raptor-KG/
+docs/huong d?n.docx
