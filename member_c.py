@@ -1,5 +1,6 @@
 """
-member_c.py - Reranker + Evaluation (Phiên bản sửa lỗi)
+member_c.py - Reranker + Evaluation
+Chiu trach nhiem: Reranker BAAI/bge-reranker-v2-m3, Evaluation metrics
 """
 
 import os
@@ -13,18 +14,15 @@ from sentence_transformers import CrossEncoder
 from tqdm import tqdm
 import logging
 
-# ============ LOGGING ============
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ============ CHECKPOINT CONFIG ============
 CKPT_DIR = pathlib.Path("/kaggle/working/C_checkpoint")
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 RERANKER_CKPT = CKPT_DIR / "reranker.pkl"
 LLM_CKPT = CKPT_DIR / "legal_llm.pkl"
 EVAL_CKPT = CKPT_DIR / "eval_fn.pkl"
 
-# ============ CONSTANTS ============
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 LLM_MODEL = "VLSP2025-LegalSML/qwen3-4b-legal-pretrain"
 
@@ -34,7 +32,7 @@ LLM_MODEL = "VLSP2025-LegalSML/qwen3-4b-legal-pretrain"
 class LegalModelWrapper:
     """
     Wrapper cho VLSP2025-LegalSML/qwen3-4b-legal-pretrain
-    Sử dụng 4-bit quantization để tiết kiệm memory
+    Su dung 4-bit quantization de tiet kiem memory
     """
     
     def __init__(self):
@@ -43,13 +41,13 @@ class LegalModelWrapper:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
     
     def load(self, force_reload: bool = False):
-        """Load model với checkpoint"""
+        """Load model voi checkpoint"""
         if not force_reload and LLM_CKPT.exists():
-            logger.info(f" Load Legal LLM từ checkpoint: {LLM_CKPT}")
+            logger.info(f"Load Legal LLM tu checkpoint: {LLM_CKPT}")
             with open(LLM_CKPT, "rb") as f:
                 return pickle.load(f)
         
-        logger.info(f" Loading {LLM_MODEL} with 4-bit quantization...")
+        logger.info(f"Loading {LLM_MODEL} with 4-bit quantization...")
         
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -73,13 +71,12 @@ class LegalModelWrapper:
                 trust_remote_code=True
             )
             
-            # Lưu checkpoint
             with open(LLM_CKPT, "wb") as f:
                 pickle.dump(self, f)
-            logger.info(f" Legal LLM checkpoint saved to {LLM_CKPT}")
+            logger.info(f"Legal LLM checkpoint saved to {LLM_CKPT}")
             
         except Exception as e:
-            logger.warning(f" Could not load LLM: {e}. Using fallback.")
+            logger.warning(f"Could not load LLM: {e}. Using fallback.")
             self.model = None
             self.tokenizer = None
         
@@ -88,7 +85,7 @@ class LegalModelWrapper:
     def generate(self, prompt: str, max_length: int = 256) -> str:
         """Generate text using Legal LLM"""
         if self.model is None:
-            logger.warning(" LLM not loaded!")
+            logger.warning("LLM not loaded!")
             return ""
         
         try:
@@ -105,7 +102,7 @@ class LegalModelWrapper:
             )
             return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         except Exception as e:
-            logger.warning(f" Generation failed: {e}")
+            logger.warning(f"Generation failed: {e}")
             return ""
 
 
@@ -123,13 +120,13 @@ class EmbeddingWrapper:
         if self.model is not None:
             return self
         
-        logger.info(f" Loading embedding model: BAAI/bge-m3...")
+        logger.info("Loading embedding model: BAAI/bge-m3...")
         try:
             from sentence_transformers import SentenceTransformer
             self.model = SentenceTransformer("BAAI/bge-m3", device=self.device)
-            logger.info(f" Embedding model loaded on {self.device}")
+            logger.info(f"Embedding model loaded on {self.device}")
         except Exception as e:
-            logger.warning(f" Could not load embedding model: {e}")
+            logger.warning(f"Could not load embedding model: {e}")
             self.model = None
         
         return self
@@ -146,7 +143,7 @@ class EmbeddingWrapper:
 class LegalReranker:
     """
     Cross-encoder reranker using BAAI/bge-reranker-v2-m3
-    Lọc tối đa 05 document_id (theo yêu cầu cuộc thi)
+    Loc toi da 05 document_id (theo yeu cau cuoc thi)
     """
     
     def __init__(self):
@@ -156,13 +153,13 @@ class LegalReranker:
         self.max_length = 512
     
     def load(self, force_reload: bool = False):
-        """Load reranker với checkpoint"""
+        """Load reranker voi checkpoint"""
         if not force_reload and RERANKER_CKPT.exists():
-            logger.info(f" Load Reranker từ checkpoint: {RERANKER_CKPT}")
+            logger.info(f"Load Reranker tu checkpoint: {RERANKER_CKPT}")
             with open(RERANKER_CKPT, "rb") as f:
                 return pickle.load(f)
         
-        logger.info(f" Loading {self.model_name} on {self.device}...")
+        logger.info(f"Loading {self.model_name} on {self.device}...")
         
         self.reranker = CrossEncoder(
             self.model_name,
@@ -171,28 +168,27 @@ class LegalReranker:
             trust_remote_code=True
         )
         
-        # Lưu checkpoint
         with open(RERANKER_CKPT, "wb") as f:
             pickle.dump(self, f)
-        logger.info(f" Reranker checkpoint saved to {RERANKER_CKPT}")
+        logger.info(f"Reranker checkpoint saved to {RERANKER_CKPT}")
         
         return self
     
     def rerank(self, query: str, candidates: List[Dict], top_k: int = 5) -> List[str]:
         """
-        Rerank candidates và trả về top_k document IDs
+        Rerank candidates va tra ve top_k document IDs
         
         Args:
-            query: Câu hỏi
+            query: Cau hoi
             candidates: List [{"id": "doc1", "text": "..."}]
-            top_k: Số lượng kết quả (mặc định 5, MAX 5 theo luật thi)
+            top_k: So luong ket qua (mac dinh 5, MAX 5 theo luat thi)
         
         Returns:
-            List[str]: Danh sách document IDs (tối đa 5)
+            List[str]: Danh sach document IDs (toi da 5)
         """
-        # LUẬT THI: TỐI ĐA 5 DOCUMENTS
+        # LUAT THI: TOI DA 5 DOCUMENTS
         if top_k > 5:
-            logger.warning(f" top_k={top_k} vượt quá 5, tự động giới hạn xuống 5")
+            logger.warning(f"top_k={top_k} vuot qua 5, tu dong gioi han xuong 5")
             top_k = 5
         
         if self.reranker is None:
@@ -201,45 +197,50 @@ class LegalReranker:
         if not candidates:
             return []
         
-        # Chuẩn bị pairs cho cross-encoder
-        pairs = [(query, c["text"]) for c in candidates]
+        # Chuan hoa candidates de tranh loi KeyError
+        normalized = []
+        for c in candidates:
+            doc_id = c.get('doc_id') or c.get('id')
+            text = c.get('passage') or c.get('text') or ''
+            if doc_id and text:
+                normalized.append({'id': str(doc_id), 'text': text})
+        
+        if not normalized:
+            return []
+        
+        # Chuan bi pairs cho cross-encoder
+        pairs = [(query, c["text"]) for c in normalized]
         
         try:
-            # Predict scores
             scores = self.reranker.predict(pairs, batch_size=32)
-            
-            # Sort by score descending
             sorted_indices = np.argsort(scores)[::-1]
+            actual_k = min(top_k, len(normalized))
+            result_ids = [normalized[i]["id"] for i in sorted_indices[:actual_k]]
             
-            # Get top_k IDs (đảm bảo không vượt quá candidates)
-            actual_k = min(top_k, len(candidates))
-            result_ids = [candidates[i]["id"] for i in sorted_indices[:actual_k]]
-            
-            logger.info(f" Reranked {len(candidates)} candidates -> {len(result_ids)} docs")
+            logger.info(f"Reranked {len(normalized)} candidates -> {len(result_ids)} docs")
             return result_ids
             
         except Exception as e:
-            logger.warning(f" Reranker error: {e}")
-            # Fallback: return first candidates
-            return [c["id"] for c in candidates[:min(top_k, len(candidates))]]
+            logger.warning(f"Reranker error: {e}")
+            return [c["id"] for c in normalized[:min(top_k, len(normalized))]]
 
 
 # ============ EVALUATION ============
 
 def recall_at_k(predicted: List[str], ground_truth: List[str], k: int = 5) -> float:
-    """Tính Recall@k"""
+    """Tinh Recall@k"""
     if not ground_truth:
         return 0.0
     hits = len(set(predicted[:k]) & set(ground_truth))
-    return hits / len(ground_truth) if ground_truth else 0.0
+    return hits / len(ground_truth)
 
 
 def precision_at_k(predicted: List[str], ground_truth: List[str], k: int = 5) -> float:
-    """Tính Precision@k"""
+    """Tinh Precision@k"""
     if not predicted:
         return 0.0
     hits = len(set(predicted[:k]) & set(ground_truth))
-    return hits / min(k, len(predicted)) if predicted else 0.0
+    return hits / min(k, len(predicted))
 
 
 def evaluate_recall_precision(
@@ -248,26 +249,18 @@ def evaluate_recall_precision(
     k: int = 5
 ) -> Dict:
     """
-    Đánh giá Recall@k và Precision@k
+    Danh gia Recall@k va Precision@k
     
-     QUAN TRỌNG: Nếu query có >5 documents → 0 điểm cho query đó
-    
-    Args:
-        ground_truth: {query_id: [relevant_doc_ids]}
-        predictions: {query_id: [predicted_doc_ids]}
-        k: Số lượng kết quả (mặc định 5)
-    
-    Returns:
-        Dict với recall@k, precision@k, và thông báo lỗi
+    QUAN TRONG: Neu query co >5 documents -> 0 diem cho query do
     """
     recall_scores = []
     precision_scores = []
     errors = []
     
     for qid, pred_docs in predictions.items():
-        # KIỂM TRA: Không được vượt quá 5 documents
+        # Kiem tra: Khong duoc vuot qua 5 documents
         if len(pred_docs) > 5:
-            error_msg = f" Query {qid} trả về {len(pred_docs)} docs (tối đa 5) -> 0 điểm"
+            error_msg = f"Query {qid} tra ve {len(pred_docs)} docs (toi da 5) -> 0 diem"
             errors.append(error_msg)
             logger.warning(error_msg)
             recall_scores.append(0.0)
@@ -280,7 +273,6 @@ def evaluate_recall_precision(
         recall_scores.append(r5)
         precision_scores.append(p5)
     
-    # Tính trung bình
     avg_recall = np.mean(recall_scores) if recall_scores else 0.0
     avg_precision = np.mean(precision_scores) if precision_scores else 0.0
     
@@ -294,20 +286,19 @@ def evaluate_recall_precision(
         "errors": errors
     }
     
-    # In kết quả
     logger.info("="*50)
-    logger.info(" KẾT QUẢ ĐÁNH GIÁ")
+    logger.info("KET QUA DANH GIA")
     logger.info("="*50)
-    logger.info(f" Recall@5:    {avg_recall:.4f}")
-    logger.info(f" Precision@5: {avg_precision:.4f}")
-    logger.info(f" Tổng queries: {len(predictions)}")
-    logger.info(f" Lỗi (>5 docs): {len(errors)}")
+    logger.info(f"Recall@5:    {avg_recall:.4f}")
+    logger.info(f"Precision@5: {avg_precision:.4f}")
+    logger.info(f"Tong queries: {len(predictions)}")
+    logger.info(f"Loi (>5 docs): {len(errors)}")
     logger.info("="*50)
     
     if avg_recall > 0.5:
-        logger.info(" Recall@5 > 0.5 - Đạt yêu cầu!")
+        logger.info("Recall@5 > 0.5 - Dat yeu cau!")
     else:
-        logger.warning(" Recall@5 <= 0.5 - Cần cải thiện!")
+        logger.warning("Recall@5 <= 0.5 - Can cai thien!")
     
     return result
 
@@ -315,39 +306,43 @@ def evaluate_recall_precision(
 # ============ HÀM PUBLIC ĐỂ NOTEBOOK GỌI ============
 
 def get_reranker(force_reload: bool = False) -> LegalReranker:
-    """Lấy hoặc load reranker từ checkpoint"""
+    """Lay hoac load reranker tu checkpoint"""
     try:
         return LegalReranker().load(force_reload=force_reload)
     except Exception as e:
-        logger.error(f" Failed to load reranker: {e}")
-        # Fallback: tạo instance mới
+        logger.error(f"Failed to load reranker: {e}")
         reranker = LegalReranker()
         reranker.reranker = None
         return reranker
 
 
 def get_llm(force_reload: bool = False) -> LegalModelWrapper:
-    """Lấy hoặc load Legal LLM từ checkpoint"""
+    """Lay hoac load Legal LLM tu checkpoint"""
     return LegalModelWrapper().load(force_reload=force_reload)
 
 
 def get_embedder(force_reload: bool = False) -> EmbeddingWrapper:
-    """Lấy hoặc load embedding model"""
+    """Lay hoac load embedding model"""
     return EmbeddingWrapper().load(force_reload=force_reload)
 
 
 def save_submission(submission: Dict, filename: str = "submission.json"):
-    """Lưu submission ra file JSON và ZIP"""
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(submission, f, ensure_ascii=False, indent=2)
-    logger.info(f" Submission saved to {filename}")
+    """Luu submission ra file JSON va ZIP"""
+    # Dinh dung format theo yeu cau BTC
+    formatted = {}
+    for qid, docs in submission.items():
+        formatted[str(qid)] = {"answer": docs}
     
-    # Tạo ZIP
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(formatted, f, ensure_ascii=False, indent=2)
+    logger.info(f"Submission saved to {filename}")
+    
+    # Tao ZIP
     import zipfile
     zip_filename = filename.replace(".json", ".zip")
     with zipfile.ZipFile(zip_filename, "w") as zipf:
         zipf.write(filename)
-    logger.info(f" Submission ZIP saved to {zip_filename}")
+    logger.info(f"Submission ZIP saved to {zip_filename}")
 
 
 def generate_submission(
@@ -357,13 +352,13 @@ def generate_submission(
     top_k: int = 5
 ) -> Dict:
     """
-    Tạo submission từ danh sách queries
+    Tao submission tu danh sach queries
     
     Args:
         queries: [{"id": "q1", "text": "..."}, ...]
-        retrieve_func: Hàm nhận query text, trả về candidates
-        reranker: Instance của LegalReranker (nếu None thì tự load)
-        top_k: Số lượng kết quả (mặc định 5)
+        retrieve_func: Ham nhan query text, tra ve candidates
+        reranker: Instance cua LegalReranker (neu None thi tu load)
+        top_k: So luong ket qua (mac dinh 5)
     
     Returns:
         {query_id: [doc_ids]}
@@ -374,44 +369,41 @@ def generate_submission(
     submission = {}
     total = len(queries)
     
-    logger.info(f" Đang tạo submission cho {total} queries...")
+    logger.info(f"Dang tao submission cho {total} queries...")
     
     for i, item in enumerate(tqdm(queries, desc="Processing queries")):
         qid = item.get("id", f"q_{i}")
         query = item.get("text", item.get("question", ""))
         
-        # Lấy candidates từ retrieval
         candidates = retrieve_func(query)
-        
-        # Rerank và lấy top_k
         top_docs = reranker.rerank(query, candidates, top_k=top_k)
         submission[str(qid)] = top_docs
     
-    logger.info(f" Đã tạo submission với {len(submission)} queries")
+    logger.info(f"Da tao submission voi {len(submission)} queries")
     return submission
 
 
 # ============ KIỂM TRA NHANH ============
 if __name__ == "__main__":
     print("="*50)
-    print(" Testing member_c.py...")
+    print("Testing member_c.py...")
     print("="*50)
     
     # Test reranker
     try:
         print("\n1. Testing Reranker...")
         reranker = get_reranker()
-        print(f"    Reranker loaded: {reranker.model_name}")
+        print(f"   Reranker loaded: {reranker.model_name}")
     except Exception as e:
-        print(f"    Reranker failed: {e}")
+        print(f"   Reranker failed: {e}")
     
     # Test evaluation
     print("\n2. Testing Evaluation...")
     gt = {"q1": ["doc1", "doc2"]}
     pred = {"q1": ["doc1", "doc3"]}
     result = evaluate_recall_precision(gt, pred)
-    print(f"    Recall: {result['recall']:.4f}")
-    print(f"    Precision: {result['precision']:.4f}")
+    print(f"   Recall: {result['recall']:.4f}")
+    print(f"   Precision: {result['precision']:.4f}")
     
     print("\n" + "="*50)
-    print(" Test complete!")
+    print("Test complete!")
