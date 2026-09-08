@@ -1,5 +1,5 @@
 """
-member_c.py - Reranker + Evaluation
+member_c.py - Reranker + Evaluation (Phiên bản sửa lỗi)
 """
 
 import os
@@ -123,7 +123,7 @@ class EmbeddingWrapper:
         if self.model is not None:
             return self
         
-        logger.info(f"⚙️ Loading embedding model: BAAI/bge-m3...")
+        logger.info(f" Loading embedding model: BAAI/bge-m3...")
         try:
             from sentence_transformers import SentenceTransformer
             self.model = SentenceTransformer("BAAI/bge-m3", device=self.device)
@@ -190,7 +190,7 @@ class LegalReranker:
         Returns:
             List[str]: Danh sách document IDs (tối đa 5)
         """
-        #  LUẬT THI: TỐI ĐA 5 DOCUMENTS
+        # LUẬT THI: TỐI ĐA 5 DOCUMENTS
         if top_k > 5:
             logger.warning(f" top_k={top_k} vượt quá 5, tự động giới hạn xuống 5")
             top_k = 5
@@ -215,7 +215,7 @@ class LegalReranker:
             actual_k = min(top_k, len(candidates))
             result_ids = [candidates[i]["id"] for i in sorted_indices[:actual_k]]
             
-            logger.debug(f" Reranked {len(candidates)} candidates -> {len(result_ids)} docs")
+            logger.info(f" Reranked {len(candidates)} candidates -> {len(result_ids)} docs")
             return result_ids
             
         except Exception as e:
@@ -265,7 +265,7 @@ def evaluate_recall_precision(
     errors = []
     
     for qid, pred_docs in predictions.items():
-        #  KIỂM TRA: Không được vượt quá 5 documents
+        # KIỂM TRA: Không được vượt quá 5 documents
         if len(pred_docs) > 5:
             error_msg = f" Query {qid} trả về {len(pred_docs)} docs (tối đa 5) -> 0 điểm"
             errors.append(error_msg)
@@ -316,7 +316,14 @@ def evaluate_recall_precision(
 
 def get_reranker(force_reload: bool = False) -> LegalReranker:
     """Lấy hoặc load reranker từ checkpoint"""
-    return LegalReranker().load(force_reload=force_reload)
+    try:
+        return LegalReranker().load(force_reload=force_reload)
+    except Exception as e:
+        logger.error(f" Failed to load reranker: {e}")
+        # Fallback: tạo instance mới
+        reranker = LegalReranker()
+        reranker.reranker = None
+        return reranker
 
 
 def get_llm(force_reload: bool = False) -> LegalModelWrapper:
@@ -386,14 +393,25 @@ def generate_submission(
 
 # ============ KIỂM TRA NHANH ============
 if __name__ == "__main__":
-    print("Testing member_c.py...")
+    print("="*50)
+    print(" Testing member_c.py...")
+    print("="*50)
     
     # Test reranker
-    reranker = get_reranker()
-    print(f"Reranker loaded: {reranker.model_name}")
+    try:
+        print("\n1. Testing Reranker...")
+        reranker = get_reranker()
+        print(f"    Reranker loaded: {reranker.model_name}")
+    except Exception as e:
+        print(f"    Reranker failed: {e}")
     
     # Test evaluation
+    print("\n2. Testing Evaluation...")
     gt = {"q1": ["doc1", "doc2"]}
     pred = {"q1": ["doc1", "doc3"]}
     result = evaluate_recall_precision(gt, pred)
-    print(f"Recall: {result['recall']:.4f}")
+    print(f"    Recall: {result['recall']:.4f}")
+    print(f"    Precision: {result['precision']:.4f}")
+    
+    print("\n" + "="*50)
+    print(" Test complete!")

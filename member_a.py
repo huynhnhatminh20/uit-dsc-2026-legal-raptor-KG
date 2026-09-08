@@ -1,6 +1,7 @@
 """
-member_a.py - RAPTOR + Vector Store
+member_a.py - RAPTOR + Vector Store (Phiên bản tối ưu hoàn chỉnh)
 """
+
 import os
 import json
 import pickle
@@ -65,8 +66,8 @@ def build_raptor(legal=None, emb=None):
         logger.warning(" Không có dữ liệu! Dùng sample documents.")
         documents = create_sample_documents()
     
-    # 4. Chunk văn bản
-    chunks = chunk_documents(documents)
+    # 4. Chunk văn bản (phiên bản tối ưu)
+    chunks = chunk_documents_optimized(documents)
     logger.info(f" Đã tạo {len(chunks)} chunks")
     
     # 5. Tạo embeddings cho chunks
@@ -74,8 +75,8 @@ def build_raptor(legal=None, emb=None):
     logger.info("   Encoding chunks...")
     embeddings = embedder.encode(texts, show_progress_bar=True)
     
-    # 6. Xây dựng cây RAPTOR
-    tree = build_raptor_tree(chunks, embeddings, embedder)
+    # 6. Xây dựng cây RAPTOR (phiên bản tối ưu)
+    tree = build_raptor_tree_optimized(chunks, embeddings, embedder, legal)
     
     # 7. Lưu checkpoint cuối cùng
     with open(RAPTOR_CKPT, "wb") as f:
@@ -87,7 +88,7 @@ def build_raptor(legal=None, emb=None):
 
 def build_vector_store(emb=None):
     """
-    Xây dựng FAISS vector store với checkpoint
+    Xây dựng FAISS vector store với checkpoint (phiên bản tối ưu)
     
     Args:
         emb: Embedding model (BAAI/bge-m3)
@@ -100,7 +101,7 @@ def build_vector_store(emb=None):
         with open(VECTOR_CKPT, "rb") as f:
             return pickle.load(f)
     
-    logger.info("⚙️ Đang xây dựng Vector Store...")
+    logger.info(" Đang xây dựng Vector Store tối ưu...")
     
     # 1. Load RAPTOR tree
     if not RAPTOR_CKPT.exists():
@@ -123,27 +124,45 @@ def build_vector_store(emb=None):
         logger.error(" Không có nodes trong tree!")
         return None
     
-    # 4. Tạo embeddings
-    texts = [n["text"] for n in all_nodes]
-    node_ids = [n["id"] for n in all_nodes]
+    # 4. Lấy text và metadata
+    texts = []
+    node_ids = []
+    metadata_list = []
     
+    for node in all_nodes:
+        texts.append(node["text"])
+        node_ids.append(node["id"])
+        metadata_list.append(node.get("metadata", {}))
+    
+    # 5. Tạo embeddings
     logger.info(f"   Encoding {len(texts)} nodes...")
     embeddings = embedder.encode(texts, show_progress_bar=True)
     
-    # 5. Tạo FAISS index
+    # 6. Tạo FAISS index (IVF cho tốc độ)
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
-    index.add(np.array(embeddings).astype('float32'))
+    
+    if len(embeddings) > 1000:
+        quantizer = faiss.IndexFlatL2(dim)
+        index = faiss.IndexIVFFlat(quantizer, dim, min(100, len(embeddings) // 10))
+        index.train(np.array(embeddings).astype('float32'))
+        index.add(np.array(embeddings).astype('float32'))
+        index_type = "IVF"
+    else:
+        index = faiss.IndexFlatL2(dim)
+        index.add(np.array(embeddings).astype('float32'))
+        index_type = "Flat"
     
     vector_store = {
         "index": index,
         "node_ids": node_ids,
         "texts": texts,
+        "metadata": metadata_list,
         "dimension": dim,
-        "num_nodes": len(node_ids)
+        "num_nodes": len(node_ids),
+        "index_type": index_type
     }
     
-    # 6. Lưu checkpoint
+    # 7. Lưu checkpoint
     with open(VECTOR_CKPT, "wb") as f:
         pickle.dump(vector_store, f)
     logger.info(f" Vector Store checkpoint lưu tại {VECTOR_CKPT}")
@@ -151,122 +170,22 @@ def build_vector_store(emb=None):
     return vector_store
 
 
-# ============ HÀM PHỤ TRỢ ============
+# ============ TỐI ƯU CHUNKING ============
 
-def load_documents(data_dir: str = "data_legalir") -> List[Dict]:
+def chunk_documents_optimized(documents: List[Dict]) -> List[Dict]:
     """
-    Đọc dữ liệu từ thư mục data_legalir
-    Hỗ trợ cả cấu trúc dữ liệu của BTC
-    """
-    documents = []
-    
-    # Các đường dẫn có thể chứa dữ liệu
-    possible_paths = [
-        data_dir,
-        "/kaggle/input/legalir",
-        "/kaggle/input/legalir-dataset",
-        "../data_legalir",
-    ]
-    
-    # Tìm đường dẫn hợp lệ
-    found_path = None
-    for path in possible_paths:
-        if os.path.exists(path):
-            found_path = path
-            break
-    
-    if found_path is None:
-        logger.warning(f" Không tìm thấy thư mục dữ liệu. Tìm trong {possible_paths}")
-        return []
-    
-    logger.info(f" Đọc dữ liệu từ: {found_path}")
-    
-    # Đọc tất cả file JSON
-    json_files = [f for f in os.listdir(found_path) if f.endswith('.json')]
-    
-    for filename in tqdm(json_files, desc="Loading files"):
-        filepath = os.path.join(found_path, filename)
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                
-                # Trường hợp 1: Dữ liệu BTC - dict với key là ID
-                if isinstance(data, dict) and all(isinstance(k, str) for k in data.keys()):
-                    for doc_id, doc_content in data.items():
-                        # Dữ liệu train.json từ BTC
-                        if "question" in doc_content:
-                            documents.append({
-                                "id": doc_id,
-                                "question": doc_content.get("question", ""),
-                                "answer": doc_content.get("answer", []),
-                                "type": "query"
-                            })
-                        # Dữ liệu văn bản
-                        elif "content" in doc_content or "text" in doc_content:
-                            documents.append({
-                                "id": doc_id,
-                                "content": doc_content.get("content", doc_content.get("text", "")),
-                                "metadata": doc_content
-                            })
-                        else:
-                            documents.append({
-                                "id": doc_id,
-                                "content": str(doc_content)
-                            })
-                
-                # Trường hợp 2: Dữ liệu dạng list
-                elif isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict):
-                            doc_id = item.get("id", f"doc_{len(documents)}")
-                            documents.append({
-                                "id": doc_id,
-                                "content": item.get("content", item.get("text", str(item))),
-                                "metadata": item
-                            })
-                
-                # Trường hợp 3: Dữ liệu dạng dict khác
-                else:
-                    documents.append({
-                        "id": f"file_{filename}",
-                        "content": str(data)
-                    })
-                    
-        except Exception as e:
-            logger.warning(f"Lỗi đọc {filename}: {e}")
-    
-    logger.info(f" Loaded {len(documents)} documents")
-    return documents
-
-
-def create_sample_documents() -> List[Dict]:
-    """Tạo dữ liệu mẫu để test"""
-    return [
-        {
-            "id": "doc_001",
-            "content": "Điều 1: Quy định chung. Khoản 1: Phạm vi điều chỉnh... Đoạn 1: Luật này quy định..."
-        },
-        {
-            "id": "doc_002",
-            "content": "Điều 2: Quyền và nghĩa vụ. Khoản 1: Quyền của người lao động..."
-        },
-        {
-            "id": "doc_003",
-            "content": "Điều 3: Trách nhiệm. Khoản 1: Trách nhiệm của người sử dụng lao động..."
-        }
-    ]
-
-
-def chunk_documents(documents: List[Dict]) -> List[Dict]:
-    """
-    Chunk văn bản theo Điều → Khoản → Đoạn
+    Chunk văn bản thông minh:
+    - Giữ nguyên cấu trúc Điều - Khoản - Điểm
+    - Thêm metadata (tên văn bản, chương, loại văn bản)
+    - Bảo toàn ngữ cảnh
     """
     chunks = []
     
     for doc in tqdm(documents, desc="Chunking documents"):
-        # Lấy nội dung
-        content = doc.get('content', '') or doc.get('text', '') or doc.get('question', '')
+        content = doc.get('content', '') or doc.get('text', '')
         doc_id = doc.get('id', f"doc_{len(chunks)}")
+        title = doc.get('title', doc.get('name', 'Văn bản pháp luật'))
+        doc_type = doc.get('type', 'unknown')
         
         if not content:
             continue
@@ -276,60 +195,97 @@ def chunk_documents(documents: List[Dict]) -> List[Dict]:
         
         if articles:
             for article in articles:
+                article_num = article['num']
+                article_text = article['text']
+                
                 # 2. Tách theo Khoản
-                clauses = split_by_clause(article["text"])
+                clauses = split_by_clause(article_text)
                 
                 if clauses:
                     for clause in clauses:
-                        # 3. Tách theo Đoạn
-                        paragraphs = split_by_paragraph(clause["text"])
+                        clause_num = clause['num']
+                        clause_text = clause['text']
                         
-                        for para in paragraphs:
-                            if len(para.strip()) > 20:  # Bỏ đoạn quá ngắn
+                        # 3. Tách theo Điểm
+                        points = split_by_point(clause_text)
+                        
+                        if points:
+                            for point in points:
+                                if len(point['text'].strip()) > 20:
+                                    chunks.append({
+                                        'id': f"{doc_id}_a{article_num}_c{clause_num}_p{point['num']}",
+                                        'text': f"[{title}] Điều {article_num}, Khoản {clause_num}, Điểm {point['num']}: {point['text'][:CHUNK_SIZE]}",
+                                        'level': 0,
+                                        'metadata': {
+                                            'doc_id': doc_id,
+                                            'title': title,
+                                            'doc_type': doc_type,
+                                            'article': article_num,
+                                            'clause': clause_num,
+                                            'point': point['num'],
+                                            'source': 'legal_document'
+                                        }
+                                    })
+                        else:
+                            # Không có Điểm, chunk theo Khoản
+                            if len(clause_text.strip()) > 20:
                                 chunks.append({
-                                    'id': f"{doc_id}_{article['num']}_{clause['num']}_{len(chunks)}",
-                                    'text': f"Điều {article['num']}, Khoản {clause['num']}: {para[:CHUNK_SIZE]}",
+                                    'id': f"{doc_id}_a{article_num}_c{clause_num}",
+                                    'text': f"[{title}] Điều {article_num}, Khoản {clause_num}: {clause_text[:CHUNK_SIZE]}",
                                     'level': 0,
                                     'metadata': {
                                         'doc_id': doc_id,
-                                        'article': article['num'],
-                                        'clause': clause['num']
+                                        'title': title,
+                                        'doc_type': doc_type,
+                                        'article': article_num,
+                                        'clause': clause_num,
+                                        'source': 'legal_document'
                                     }
                                 })
                 else:
                     # Không có Khoản, chunk theo Điều
-                    if len(article["text"].strip()) > 20:
+                    if len(article_text.strip()) > 20:
                         chunks.append({
-                            'id': f"{doc_id}_{article['num']}_{len(chunks)}",
-                            'text': f"Điều {article['num']}: {article['text'][:CHUNK_SIZE]}",
+                            'id': f"{doc_id}_a{article_num}",
+                            'text': f"[{title}] Điều {article_num}: {article_text[:CHUNK_SIZE]}",
                             'level': 0,
-                            'metadata': {'doc_id': doc_id, 'article': article['num']}
+                            'metadata': {
+                                'doc_id': doc_id,
+                                'title': title,
+                                'doc_type': doc_type,
+                                'article': article_num,
+                                'source': 'legal_document'
+                            }
                         })
         else:
-            # Không có Điều, chunk nguyên văn
+            # Không có Điều, chunk theo đoạn
             paragraphs = content.split('\n\n')
             for p_idx, para in enumerate(paragraphs):
                 if para.strip():
                     chunks.append({
                         'id': f"{doc_id}_chunk_{p_idx}",
-                        'text': para.strip()[:CHUNK_SIZE],
+                        'text': f"[{title}] {para.strip()[:CHUNK_SIZE]}",
                         'level': 0,
-                        'metadata': {'doc_id': doc_id}
+                        'metadata': {
+                            'doc_id': doc_id,
+                            'title': title,
+                            'doc_type': doc_type,
+                            'source': 'legal_document'
+                        }
                     })
     
     # Lưu chunk checkpoint
     with open(CHUNK_CKPT, "wb") as f:
         pickle.dump(chunks, f)
     
+    logger.info(f" Đã tạo {len(chunks)} chunks")
     return chunks
 
 
 def split_by_article(text: str) -> List[Dict]:
     """Tách văn bản thành các Điều"""
-    # Pattern cho Điều
-    pattern = r'(Điều\s+(\d+)[\.\:\s]+)'
+    pattern = r'(Điều\s+(\d+[a-zA-Z]?)[\.\:\s]+)'
     
-    # Nếu không có Điều, trả về empty
     if not re.search(pattern, text):
         return []
     
@@ -347,8 +303,7 @@ def split_by_article(text: str) -> List[Dict]:
 
 def split_by_clause(text: str) -> List[Dict]:
     """Tách thành các Khoản"""
-    # Pattern cho Khoản
-    pattern = r'[Kk]hoản\s+(\d+)[\.\:\s]+'
+    pattern = r'[Kk]hoản\s+(\d+[a-zA-Z]?)[\.\:\s]+'
     
     if not re.search(pattern, text):
         return []
@@ -365,25 +320,52 @@ def split_by_clause(text: str) -> List[Dict]:
     return clauses
 
 
+def split_by_point(text: str) -> List[Dict]:
+    """Tách thành các Điểm (a, b, c, ...)"""
+    pattern = r'([a-zâêôơưđ])\s*[\)\.]\s*'
+    
+    if not re.search(pattern, text):
+        return []
+    
+    parts = re.split(pattern, text)
+    points = []
+    
+    # parts[0] là text trước điểm đầu tiên
+    if parts and parts[0].strip():
+        points.append({
+            'num': '0',
+            'text': parts[0].strip()
+        })
+    
+    for i in range(1, len(parts), 2):
+        if i+1 < len(parts):
+            num = parts[i].strip()
+            content = parts[i+1].strip()
+            if content:
+                points.append({
+                    'num': num,
+                    'text': content
+                })
+    
+    return points
+
+
 def split_by_paragraph(text: str) -> List[str]:
     """Tách thành các Đoạn (theo dấu xuống dòng)"""
     paragraphs = re.split(r'\n\s*\n', text)
     return [p.strip() for p in paragraphs if p.strip()]
 
 
-def build_raptor_tree(chunks: List[Dict], embeddings: np.ndarray, embedder) -> Dict:
+# ============ TỐI ƯU RAPTOR TREE ============
+
+def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embedder, legal_llm=None) -> Dict:
     """
-    Xây dựng cây RAPTOR với checkpoint mỗi 50 chunk
-    
-    Args:
-        chunks: List của chunks
-        embeddings: Embeddings của chunks
-        embedder: SentenceTransformer model
-    
-    Returns:
-        Dict: RAPTOR tree
+    Xây dựng cây RAPTOR tối ưu với:
+    - AgglomerativeClustering thay vì KMeans
+    - LLM summarization nếu có
+    - 3 levels
     """
-    logger.info(" Xây dựng RAPTOR tree...")
+    logger.info(" Xây dựng RAPTOR tree tối ưu...")
     
     tree = {
         "nodes": [],
@@ -396,45 +378,49 @@ def build_raptor_tree(chunks: List[Dict], embeddings: np.ndarray, embedder) -> D
     tree["levels"].append({"level": 0, "node_ids": [n["id"] for n in level_0]})
     logger.info(f"   Level 0: {len(level_0)} nodes")
     
-    # Checkpoint sau level 0
     with open(RAPTOR_CKPT, "wb") as f:
         pickle.dump(tree, f)
-    logger.info("  Checkpoint saved (level 0)")
+    logger.info("    Checkpoint saved (level 0)")
     
     # ============ LEVEL 1: Clusters ============
-    if len(chunks) > 3:
+    if len(chunks) > 5:
         logger.info("   Building level 1 clusters...")
         
         try:
-            from sklearn.cluster import KMeans
+            from sklearn.cluster import AgglomerativeClustering
             
-            # Tính số cluster
-            n_clusters = min(max(2, len(chunks) // 5), 20)
-            logger.info(f"   Number of clusters: {n_clusters}")
+            n_clusters = min(max(3, len(chunks) // 4), 15)
             
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(embeddings.astype('float32'))
+            clustering = AgglomerativeClustering(
+                n_clusters=n_clusters,
+                metric='cosine',
+                linkage='average'
+            )
+            labels = clustering.fit_predict(embeddings.astype('float32'))
             
-            # Tạo node tóm tắt cho mỗi cluster
             level_1 = []
             for cluster_idx in range(n_clusters):
                 cluster_indices = [i for i, label in enumerate(labels) if label == cluster_idx]
-                cluster_texts = [chunks[i]["text"] for i in cluster_indices]
+                cluster_chunks = [chunks[i] for i in cluster_indices]
+                cluster_texts = [c["text"] for c in cluster_chunks]
                 
-                if cluster_texts and len(cluster_texts) > 1:
-                    # Tóm tắt cluster
-                    summary = summarize_cluster(cluster_texts, embedder)
+                if len(cluster_texts) > 1:
+                    if legal_llm is not None:
+                        summary = summarize_cluster_with_llm(cluster_texts, legal_llm)
+                    else:
+                        summary = summarize_cluster_advanced(cluster_texts, embedder)
+                    
                     level_1.append({
                         "id": f"cluster_{cluster_idx}",
                         "text": summary,
                         "level": 1,
                         "metadata": {
                             "cluster_size": len(cluster_texts),
-                            "children": [chunks[i]["id"] for i in cluster_indices]
+                            "children": [c["id"] for c in cluster_chunks],
+                            "cluster_indices": cluster_indices
                         }
                     })
                 elif cluster_texts:
-                    # Chỉ có 1 node, giữ nguyên
                     idx = cluster_indices[0]
                     level_1.append(chunks[idx])
             
@@ -442,11 +428,56 @@ def build_raptor_tree(chunks: List[Dict], embeddings: np.ndarray, embedder) -> D
             tree["levels"].append({"level": 1, "node_ids": [n["id"] for n in level_1]})
             logger.info(f"   Level 1: {len(level_1)} nodes")
             
-            # Checkpoint sau level 1
             with open(RAPTOR_CKPT, "wb") as f:
                 pickle.dump(tree, f)
-            logger.info("    Checkpoint saved (level 1)")
+            logger.info("   Checkpoint saved (level 1)")
             
+            # ============ LEVEL 2: Clusters of clusters ============
+            if len(level_1) > 5:
+                logger.info("   Building level 2 clusters...")
+                
+                level_1_texts = [n["text"] for n in level_1]
+                level_1_embeddings = embedder.encode(level_1_texts, show_progress_bar=False)
+                
+                n_clusters_2 = min(max(2, len(level_1) // 3), 10)
+                clustering_2 = AgglomerativeClustering(
+                    n_clusters=n_clusters_2,
+                    metric='cosine',
+                    linkage='average'
+                )
+                labels_2 = clustering_2.fit_predict(level_1_embeddings.astype('float32'))
+                
+                level_2 = []
+                for cluster_idx in range(n_clusters_2):
+                    cluster_indices = [i for i, label in enumerate(labels_2) if label == cluster_idx]
+                    cluster_nodes = [level_1[i] for i in cluster_indices]
+                    cluster_texts = [n["text"] for n in cluster_nodes]
+                    
+                    if len(cluster_texts) > 1:
+                        if legal_llm is not None:
+                            summary = summarize_cluster_with_llm(cluster_texts, legal_llm)
+                        else:
+                            summary = summarize_cluster_advanced(cluster_texts, embedder)
+                        
+                        level_2.append({
+                            "id": f"cluster_level2_{cluster_idx}",
+                            "text": summary,
+                            "level": 2,
+                            "metadata": {
+                                "cluster_size": len(cluster_texts),
+                                "children": [n["id"] for n in cluster_nodes]
+                            }
+                        })
+                
+                if level_2:
+                    tree["nodes"].extend(level_2)
+                    tree["levels"].append({"level": 2, "node_ids": [n["id"] for n in level_2]})
+                    logger.info(f"   Level 2: {len(level_2)} nodes")
+                    
+                    with open(RAPTOR_CKPT, "wb") as f:
+                        pickle.dump(tree, f)
+                    logger.info("   Checkpoint saved (level 2)")
+                
         except Exception as e:
             logger.warning(f" Clustering failed: {e}")
     
@@ -454,16 +485,9 @@ def build_raptor_tree(chunks: List[Dict], embeddings: np.ndarray, embedder) -> D
     return tree
 
 
-def summarize_cluster(texts: List[str], embedder=None) -> str:
+def summarize_cluster_advanced(texts: List[str], embedder) -> str:
     """
-    Tóm tắt một cụm văn bản
-    
-    Args:
-        texts: List các văn bản trong cụm
-        embedder: Embedding model (dùng để chọn representative)
-    
-    Returns:
-        str: Văn bản tóm tắt
+    Tóm tắt cluster bằng cách lấy các đoạn đại diện
     """
     if not texts:
         return ""
@@ -471,30 +495,149 @@ def summarize_cluster(texts: List[str], embedder=None) -> str:
     if len(texts) == 1:
         return texts[0]
     
-    # Cách 1: Chọn câu dài nhất (đơn giản)
-    longest = max(texts, key=len)
+    try:
+        embeddings = embedder.encode(texts, show_progress_bar=False)
+        mean_emb = np.mean(embeddings, axis=0)
+        distances = np.linalg.norm(embeddings - mean_emb, axis=1)
+        
+        center_indices = np.argsort(distances)[:min(3, len(texts))]
+        center_texts = [texts[i] for i in center_indices]
+        
+        if len(center_texts) == 1:
+            return f"[Tóm tắt {len(texts)} văn bản] {center_texts[0][:300]}"
+        
+        summary = f"[Tóm tắt {len(texts)} văn bản]\n"
+        for i, text in enumerate(center_texts, 1):
+            summary += f"({i}) {text[:200]}...\n"
+        
+        return summary.strip()
+        
+    except Exception as e:
+        logger.warning(f" Advanced summarization failed: {e}")
+        return texts[0][:300] + "..."
+
+
+def summarize_cluster_with_llm(texts: List[str], legal_llm) -> str:
+    """
+    Tóm tắt cluster bằng Legal 4B LLM
+    """
+    if not texts:
+        return ""
     
-    # Cách 2: Nếu có embedder, chọn câu gần trung tâm nhất
-    if embedder is not None:
+    if len(texts) == 1:
+        return texts[0]
+    
+    try:
+        sample_texts = texts[:5]
+        combined_text = "\n---\n".join([t[:300] for t in sample_texts])
+        
+        prompt = f"""Tóm tắt các văn bản pháp luật sau thành một đoạn ngắn gọn (tối đa 100 từ), giữ nguyên các số hiệu điều luật quan trọng và thuật ngữ pháp lý:
+
+{combined_text}
+
+Tóm tắt:"""
+        
+        response = legal_llm.generate(prompt, max_length=150)
+        summary = response.strip()
+        
+        if len(summary) > 500:
+            summary = summary[:500] + "..."
+        
+        return f"[LLM Tóm tắt {len(texts)} văn bản] {summary}"
+        
+    except Exception as e:
+        logger.warning(f" LLM summarization failed: {e}")
+        return summarize_cluster_advanced(texts, None)
+
+
+# ============ HÀM PHỤ TRỢ ============
+
+def load_documents(data_dir: str = "data_legalir") -> List[Dict]:
+    """Đọc dữ liệu từ thư mục data_legalir"""
+    documents = []
+    
+    possible_paths = [
+        data_dir,
+        "/kaggle/input/legalir",
+        "/kaggle/input/legalir-dataset",
+        "../data_legalir",
+    ]
+    
+    found_path = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            found_path = path
+            break
+    
+    if found_path is None:
+        logger.warning(f" Không tìm thấy thư mục dữ liệu.")
+        return []
+    
+    logger.info(f" Đọc dữ liệu từ: {found_path}")
+    
+    json_files = [f for f in os.listdir(found_path) if f.endswith('.json')]
+    
+    for filename in tqdm(json_files, desc="Loading files"):
+        filepath = os.path.join(found_path, filename)
         try:
-            embeddings = embedder.encode(texts, show_progress_bar=False)
-            mean_emb = np.mean(embeddings, axis=0)
-            distances = np.linalg.norm(embeddings - mean_emb, axis=1)
-            center_idx = np.argmin(distances)
-            center_text = texts[center_idx]
-            
-            # Nếu center text dài hơn 200, cắt ngắn
-            if len(center_text) > 300:
-                return f"[Tóm tắt {len(texts)} văn bản] {center_text[:300]}..."
-            return f"[Tóm tắt {len(texts)} văn bản] {center_text}"
-            
-        except Exception:
-            pass
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    for doc_id, doc_content in data.items():
+                        if "question" in doc_content:
+                            documents.append({
+                                "id": doc_id,
+                                "question": doc_content.get("question", ""),
+                                "answer": doc_content.get("answer", []),
+                                "type": "query"
+                            })
+                        elif "content" in doc_content or "text" in doc_content:
+                            title = doc_content.get("title", doc_content.get("name", "Văn bản"))
+                            documents.append({
+                                "id": doc_id,
+                                "title": title,
+                                "content": doc_content.get("content", doc_content.get("text", "")),
+                                "type": doc_content.get("type", "legal"),
+                                "metadata": doc_content
+                            })
+                elif isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            doc_id = item.get("id", f"doc_{len(documents)}")
+                            title = item.get("title", item.get("name", "Văn bản"))
+                            documents.append({
+                                "id": doc_id,
+                                "title": title,
+                                "content": item.get("content", item.get("text", str(item))),
+                                "type": item.get("type", "legal"),
+                                "metadata": item
+                            })
+        except Exception as e:
+            logger.warning(f"Lỗi đọc {filename}: {e}")
     
-    # Fallback
-    if len(longest) > 300:
-        return f"[Tóm tắt {len(texts)} văn bản] {longest[:300]}..."
-    return f"[Tóm tắt {len(texts)} văn bản] {longest}"
+    logger.info(f" Loaded {len(documents)} documents")
+    return documents
+
+
+def create_sample_documents() -> List[Dict]:
+    """Tạo dữ liệu mẫu để test"""
+    return [
+        {
+            "id": "doc_001",
+            "title": "Luật Mẫu 1",
+            "content": "Điều 1: Quy định chung. Khoản 1: Phạm vi điều chỉnh... Đoạn 1: Luật này quy định..."
+        },
+        {
+            "id": "doc_002",
+            "title": "Luật Mẫu 2",
+            "content": "Điều 2: Quyền và nghĩa vụ. Khoản 1: Quyền của người lao động..."
+        },
+        {
+            "id": "doc_003",
+            "title": "Luật Mẫu 3",
+            "content": "Điều 3: Trách nhiệm. Khoản 1: Trách nhiệm của người sử dụng lao động..."
+        }
+    ]
 
 
 def get_raptor_nodes() -> List[Dict]:
@@ -519,11 +662,12 @@ def get_vector_store() -> Optional[Dict]:
 
 # ============ KIỂM TRA NHANH ============
 if __name__ == "__main__":
-    # Test nhanh
-    print("Testing member_a.py...")
+    print("Testing member_a.py (optimized version)...")
     tree = build_raptor()
     print(f"Tree nodes: {len(tree.get('nodes', []))}")
+    print(f"Levels: {len(tree.get('levels', []))}")
     
     vector_store = build_vector_store()
     if vector_store:
         print(f"Vector store: {vector_store.get('num_nodes', 0)} vectors")
+        print(f"Index type: {vector_store.get('index_type', 'unknown')}")
