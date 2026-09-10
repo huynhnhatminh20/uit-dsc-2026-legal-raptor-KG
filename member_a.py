@@ -34,7 +34,7 @@ CLUSTER_THRESHOLD = 0.7
 
 # ============ HÀM CHÍNH ============
 
-def build_raptor(legal=None, emb=None, max_docs=None):
+def build_raptor(legal=None, emb=None):
     """
     Xây dựng RAPTOR tree với checkpoint
     
@@ -65,9 +65,7 @@ def build_raptor(legal=None, emb=None, max_docs=None):
     if not documents:
         logger.warning(" Không có dữ liệu! Dùng sample documents.")
         documents = create_sample_documents()
-    if max_docs is not None:
-        documents = documents[:max_docs]
-        logger.info(f" Test mode: chỉ dùng {len(documents)} documents")    
+
     
     # 4. Chunk văn bản (phiên bản tối ưu)
     chunks = chunk_documents_optimized(documents)
