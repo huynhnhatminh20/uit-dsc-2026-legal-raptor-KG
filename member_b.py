@@ -351,20 +351,26 @@ def get_graph_scores(query: str, top_k: int) -> Dict[str, float]:
         entities = extract_entities_advanced(query)
         
         for entity in entities:
-            entity_lower = entity.lower()
-            
+            # extract_entities_advanced() trả về dict:
+            # {'type': ..., 'value': ..., 'metadata': ...}
+            entity_value = str(entity.get("value", ""))
+            entity_lower = entity_value.lower()
+    
+            if not entity_lower:
+                continue
+    
             # Tìm nodes chứa entity
             for node_id in G.nodes():
                 node_text = str(G.nodes[node_id].get("text", "")).lower()
                 node_value = str(G.nodes[node_id].get("value", "")).lower()
-                
+        
                 if entity_lower in node_text or entity_lower in node_value:
                     # Score cao hơn nếu match chính xác
-                    if entity in node_text or entity in node_value:
+                    if entity_lower == node_value:
                         graph_scores[node_id] += 2.0
                     else:
                         graph_scores[node_id] += 1.0
-                    
+            
                     # Multi-hop: thêm score cho neighbors
                     for neighbor in G.neighbors(node_id):
                         graph_scores[neighbor] += 0.5
