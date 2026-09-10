@@ -65,6 +65,7 @@ def build_raptor(legal=None, emb=None):
     if not documents:
         logger.warning(" Không có dữ liệu! Dùng sample documents.")
         documents = create_sample_documents()
+
     
     # 4. Chunk văn bản (phiên bản tối ưu)
     chunks = chunk_documents_optimized(documents)
@@ -73,7 +74,7 @@ def build_raptor(legal=None, emb=None):
     # 5. Tạo embeddings cho chunks
     texts = [c["text"] for c in chunks]
     logger.info("   Encoding chunks...")
-    embeddings = embedder.encode(texts, show_progress_bar=True)
+    embeddings = embedder.encode(texts)
     
     # 6. Xây dựng cây RAPTOR (phiên bản tối ưu)
     tree = build_raptor_tree_optimized(chunks, embeddings, embedder, legal)
@@ -136,7 +137,7 @@ def build_vector_store(emb=None):
     
     # 5. Tạo embeddings
     logger.info(f"   Encoding {len(texts)} nodes...")
-    embeddings = embedder.encode(texts, show_progress_bar=True)
+    embeddings = embedder.encode(texts)
     
     # 6. Tạo FAISS index (IVF cho tốc độ)
     dim = embeddings.shape[1]
@@ -387,16 +388,28 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
         logger.info("   Building level 1 clusters...")
         
         try:
-            from sklearn.cluster import AgglomerativeClustering
-            
+            from sklearn.cluster import MiniBatchKMeans
+
+            # LƯU Ý: AgglomerativeClustering cần ma trận khoảng cách O(n^2) -
+            # với ~387k chunks (kho 8.5k văn bản thật) sẽ cần hàng trăm GB RAM
+            # và chắc chắn crash/treo trên Kaggle. Dùng MiniBatchKMeans thay
+            # thế vì nó chỉ cần O(n) bộ nhớ và scale tốt tới hàng triệu điểm.
             n_clusters = min(max(3, len(chunks) // 4), 15)
-            
-            clustering = AgglomerativeClustering(
+
+            # Chuẩn hoá vector về độ dài 1 để KMeans (dùng khoảng cách Euclid)
+            # xấp xỉ đúng hành vi của cosine similarity.
+            emb_f32 = embeddings.astype('float32')
+            norms = np.linalg.norm(emb_f32, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            emb_normalized = emb_f32 / norms
+
+            clustering = MiniBatchKMeans(
                 n_clusters=n_clusters,
-                metric='cosine',
-                linkage='average'
+                batch_size=min(2048, len(chunks)),
+                n_init=3,
+                random_state=42,
             )
-            labels = clustering.fit_predict(embeddings.astype('float32'))
+            labels = clustering.fit_predict(emb_normalized)
             
             level_1 = []
             for cluster_idx in range(n_clusters):
@@ -437,15 +450,20 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
                 logger.info("   Building level 2 clusters...")
                 
                 level_1_texts = [n["text"] for n in level_1]
-                level_1_embeddings = embedder.encode(level_1_texts, show_progress_bar=False)
+                level_1_embeddings = embedder.encode(level_1_texts)
                 
                 n_clusters_2 = min(max(2, len(level_1) // 3), 10)
-                clustering_2 = AgglomerativeClustering(
+                l1_f32 = level_1_embeddings.astype('float32')
+                l1_norms = np.linalg.norm(l1_f32, axis=1, keepdims=True)
+                l1_norms[l1_norms == 0] = 1.0
+                l1_normalized = l1_f32 / l1_norms
+                clustering_2 = MiniBatchKMeans(
                     n_clusters=n_clusters_2,
-                    metric='cosine',
-                    linkage='average'
+                    batch_size=min(2048, len(level_1)),
+                    n_init=3,
+                    random_state=42,
                 )
-                labels_2 = clustering_2.fit_predict(level_1_embeddings.astype('float32'))
+                labels_2 = clustering_2.fit_predict(l1_normalized)
                 
                 level_2 = []
                 for cluster_idx in range(n_clusters_2):
@@ -496,7 +514,7 @@ def summarize_cluster_advanced(texts: List[str], embedder) -> str:
         return texts[0]
     
     try:
-        embeddings = embedder.encode(texts, show_progress_bar=False)
+        embeddings = embedder.encode(texts)
         mean_emb = np.mean(embeddings, axis=0)
         distances = np.linalg.norm(embeddings - mean_emb, axis=1)
         
@@ -553,69 +571,127 @@ Tóm tắt:"""
 # ============ HÀM PHỤ TRỢ ============
 
 def load_documents(data_dir: str = "data_legalir") -> List[Dict]:
-    """Đọc dữ liệu từ thư mục data_legalir"""
+    """Đọc dữ liệu từ thư mục chứa các file context_*.json của BTC.
+
+    Định dạng thật của BTC: MỖI FILE = MỘT văn bản duy nhất, dạng phẳng:
+        {"id": 740, "name": "...", "link": "...", "passage": "..."}
+    (không phải 1 file = nhiều văn bản, và field nội dung là "passage",
+    không phải "content"/"text").
+
+    Hàm này đọc cả 3 khả năng để không bị vỡ nếu định dạng thay đổi:
+      1) File phẳng 1-văn-bản/file (định dạng thật của BTC) — ưu tiên.
+      2) File dạng {"doc_id": {...}, ...} (nhiều văn bản/file).
+      3) File dạng list các văn bản.
+    """
     documents = []
-    
+
     possible_paths = [
         data_dir,
         "/kaggle/input/legalir",
         "/kaggle/input/legalir-dataset",
+        "/kaggle/input/selected-contexts",
+        "/content/selected-contexts",
         "../data_legalir",
     ]
-    
+
     found_path = None
     for path in possible_paths:
         if os.path.exists(path):
             found_path = path
             break
-    
+
     if found_path is None:
         logger.warning(f" Không tìm thấy thư mục dữ liệu.")
         return []
-    
+
+    # Nếu path chứa 1 thư mục con duy nhất (VD giải nén zip ra subfolder),
+    # và thư mục gốc không có sẵn .json, thì đi vào thư mục con đó.
+    if not any(f.endswith('.json') for f in os.listdir(found_path)):
+        subdirs = [os.path.join(found_path, d) for d in os.listdir(found_path)
+                   if os.path.isdir(os.path.join(found_path, d))]
+        for sd in subdirs:
+            if any(f.endswith('.json') for f in os.listdir(sd)):
+                found_path = sd
+                break
+
     logger.info(f" Đọc dữ liệu từ: {found_path}")
-    
+
     json_files = [f for f in os.listdir(found_path) if f.endswith('.json')]
-    
+    n_empty = 0
+
+    def _norm_id(x):
+        return str(x)
+
     for filename in tqdm(json_files, desc="Loading files"):
         filepath = os.path.join(found_path, filename)
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                if isinstance(data, dict):
-                    for doc_id, doc_content in data.items():
-                        if "question" in doc_content:
-                            documents.append({
-                                "id": doc_id,
-                                "question": doc_content.get("question", ""),
-                                "answer": doc_content.get("answer", []),
-                                "type": "query"
-                            })
-                        elif "content" in doc_content or "text" in doc_content:
-                            title = doc_content.get("title", doc_content.get("name", "Văn bản"))
-                            documents.append({
-                                "id": doc_id,
-                                "title": title,
-                                "content": doc_content.get("content", doc_content.get("text", "")),
-                                "type": doc_content.get("type", "legal"),
-                                "metadata": doc_content
-                            })
-                elif isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict):
-                            doc_id = item.get("id", f"doc_{len(documents)}")
-                            title = item.get("title", item.get("name", "Văn bản"))
-                            documents.append({
-                                "id": doc_id,
-                                "title": title,
-                                "content": item.get("content", item.get("text", str(item))),
-                                "type": item.get("type", "legal"),
-                                "metadata": item
-                            })
+
+            # Case 1: 1 file = 1 văn bản phẳng (định dạng thật của BTC)
+            if isinstance(data, dict) and (
+                "passage" in data or "content" in data or "text" in data
+            ) and "id" in data:
+                content = data.get("passage", "") or data.get("content", "") or data.get("text", "")
+                if not content:
+                    n_empty += 1
+                    continue
+                title = data.get("name", data.get("title", "Văn bản"))
+                documents.append({
+                    "id": _norm_id(data.get("id")),
+                    "title": title,
+                    "content": content,
+                    "type": data.get("type", "legal"),
+                    "metadata": data,
+                })
+
+            # Case 2: 1 file = nhiều văn bản, dạng {doc_id: {...}}
+            elif isinstance(data, dict):
+                for doc_id, doc_content in data.items():
+                    if not isinstance(doc_content, dict):
+                        continue
+                    if "question" in doc_content:
+                        documents.append({
+                            "id": _norm_id(doc_id),
+                            "question": doc_content.get("question", ""),
+                            "answer": doc_content.get("answer", []),
+                            "type": "query"
+                        })
+                    elif any(k in doc_content for k in ("content", "text", "passage")):
+                        title = doc_content.get("title", doc_content.get("name", "Văn bản"))
+                        content = doc_content.get("content", doc_content.get("text", doc_content.get("passage", "")))
+                        if not content:
+                            n_empty += 1
+                            continue
+                        documents.append({
+                            "id": _norm_id(doc_content.get("id", doc_id)),
+                            "title": title,
+                            "content": content,
+                            "type": doc_content.get("type", "legal"),
+                            "metadata": doc_content
+                        })
+
+            # Case 3: 1 file = list các văn bản
+            elif isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    title = item.get("title", item.get("name", "Văn bản"))
+                    content = item.get("content", item.get("text", item.get("passage", "")))
+                    if not content:
+                        n_empty += 1
+                        continue
+                    documents.append({
+                        "id": _norm_id(item.get("id", f"doc_{len(documents)}")),
+                        "title": title,
+                        "content": content,
+                        "type": item.get("type", "legal"),
+                        "metadata": item
+                    })
         except Exception as e:
             logger.warning(f"Lỗi đọc {filename}: {e}")
-    
-    logger.info(f" Loaded {len(documents)} documents")
+
+    logger.info(f" Loaded {len(documents)} documents (bỏ qua {n_empty} văn bản rỗng)")
     return documents
 
 
@@ -658,6 +734,38 @@ def get_vector_store() -> Optional[Dict]:
     
     with open(VECTOR_CKPT, "rb") as f:
         return pickle.load(f)
+
+
+_NODE_DOC_MAP_CACHE: Optional[Dict[str, str]] = None
+
+
+def get_node_doc_map() -> Dict[str, str]:
+    """
+    Trả về dict {node_id: document_id}.
+
+    QUAN TRỌNG: chỉ node level 0 (chunk gốc, VD "115374_a3_c22") mới ứng
+    với ĐÚNG MỘT document_id (lưu trong metadata['doc_id']). Node level 1/2
+    là cluster tóm tắt gộp chunk từ NHIỀU văn bản khác nhau -> không có 1
+    document_id duy nhất, nên KHÔNG được đưa vào map này. Nơi dùng map này
+    (hybrid_retrieve, reranker) phải tự loại các node không có trong map.
+
+    Kết quả được cache trong bộ nhớ (module-level) để không phải quét lại
+    toàn bộ RAPTOR tree (có thể ~387k node) mỗi lần gọi.
+    """
+    global _NODE_DOC_MAP_CACHE
+    if _NODE_DOC_MAP_CACHE is not None:
+        return _NODE_DOC_MAP_CACHE
+
+    nodes = get_raptor_nodes()
+    doc_map = {}
+    for n in nodes:
+        if n.get("level", 0) == 0:
+            doc_id = n.get("metadata", {}).get("doc_id")
+            if doc_id is not None:
+                doc_map[n["id"]] = str(doc_id)
+
+    _NODE_DOC_MAP_CACHE = doc_map
+    return doc_map
 
 
 # ============ KIỂM TRA NHANH ============
