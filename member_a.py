@@ -139,7 +139,7 @@ def build_vector_store(emb=None):
     
     # 5. Tạo embeddings
     logger.info(f"   Encoding {len(texts)} nodes...")
-    embeddings = embedder.encode(texts, show_progress_bar=True)
+    embeddings = embedder.encode(texts)
     
     # 6. Tạo FAISS index (IVF cho tốc độ)
     dim = embeddings.shape[1]
@@ -452,7 +452,7 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
                 logger.info("   Building level 2 clusters...")
                 
                 level_1_texts = [n["text"] for n in level_1]
-                level_1_embeddings = embedder.encode(level_1_texts, show_progress_bar=False)
+                level_1_embeddings = embedder.encode(level_1_texts)
                 
                 n_clusters_2 = min(max(2, len(level_1) // 3), 10)
                 l1_f32 = level_1_embeddings.astype('float32')
@@ -516,7 +516,7 @@ def summarize_cluster_advanced(texts: List[str], embedder) -> str:
         return texts[0]
     
     try:
-        embeddings = embedder.encode(texts, show_progress_bar=False)
+        embeddings = embedder.encode(texts)
         mean_emb = np.mean(embeddings, axis=0)
         distances = np.linalg.norm(embeddings - mean_emb, axis=1)
         
