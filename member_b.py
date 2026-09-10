@@ -69,7 +69,7 @@ def _get_bm25_cached():
 
 # ============ HÀM CHÍNH ============
 
-def build_graph(legal=None, max_nodes=None):
+def build_graph(legal=None):
     """
     Xây dựng Knowledge Graph với checkpoint và LLM entity extraction
     
@@ -100,9 +100,7 @@ def build_graph(legal=None, max_nodes=None):
         nodes = create_sample_nodes()
     
     logger.info(f" Có {len(nodes)} nodes từ RAPTOR")
-    if max_nodes is not None:
-        nodes = nodes[:max_nodes]
-        logger.info(f" Test mode: chỉ dùng {len(nodes)} nodes")
+
     
     # 3. Xây dựng Graph với LLM
     G = build_knowledge_graph_optimized(nodes, legal)
