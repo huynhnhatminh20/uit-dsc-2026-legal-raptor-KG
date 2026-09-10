@@ -211,11 +211,21 @@ class LegalReranker:
             # Sort by score descending
             sorted_indices = np.argsort(scores)[::-1]
             
-            # Get top_k IDs (đảm bảo không vượt quá candidates)
-            actual_k = min(top_k, len(candidates))
-            result_ids = [candidates[i]["id"] for i in sorted_indices[:actual_k]]
+            # Lấy top_k ID, khử trùng lặp (phòng hờ nếu candidates còn sót
+            # 2 chunk khác nhau của CÙNG 1 document_id - chỉ giữ bản có
+            # điểm rerank cao nhất, tránh lãng phí 1 trong 5 slot cho phép)
+            result_ids = []
+            seen = set()
+            for i in sorted_indices:
+                cid = candidates[i]["id"]
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                result_ids.append(cid)
+                if len(result_ids) >= top_k:
+                    break
             
-            logger.info(f" Reranked {len(candidates)} candidates -> {len(result_ids)} docs")
+            logger.info(f" Reranked {len(candidates)} candidates -> {len(result_ids)} docs (unique)")
             return result_ids
             
         except Exception as e:
@@ -264,7 +274,11 @@ def evaluate_recall_precision(
     precision_scores = []
     errors = []
     
-    for qid, pred_docs in predictions.items():
+    for qid, pred_value in predictions.items():
+        # Chấp nhận cả 2 dạng: {"qid": {"answer": [...]}} (đúng format
+        # submission.json thật của BTC) và {"qid": [...]} (dạng rút gọn cũ)
+        pred_docs = pred_value.get("answer", []) if isinstance(pred_value, dict) else pred_value
+
         # KIỂM TRA: Không được vượt quá 5 documents
         if len(pred_docs) > 5:
             error_msg = f" Query {qid} trả về {len(pred_docs)} docs (tối đa 5) -> 0 điểm"
@@ -274,7 +288,10 @@ def evaluate_recall_precision(
             precision_scores.append(0.0)
             continue
         
-        gt_docs = ground_truth.get(qid, [])
+        # ground_truth có thể là train.json gốc {"qid": {"question":..., "answer":[...]}}
+        # hoặc dạng rút gọn {"qid": [...]} -> chấp nhận cả 2.
+        gt_value = ground_truth.get(qid, [])
+        gt_docs = gt_value.get("answer", []) if isinstance(gt_value, dict) else gt_value
         r5 = recall_at_k(pred_docs, gt_docs, k=k)
         p5 = precision_at_k(pred_docs, gt_docs, k=k)
         recall_scores.append(r5)
@@ -385,7 +402,10 @@ def generate_submission(
         
         # Rerank và lấy top_k
         top_docs = reranker.rerank(query, candidates, top_k=top_k)
-        submission[str(qid)] = top_docs
+        # QUAN TRỌNG: định dạng BTC yêu cầu là {"qid": {"answer": [...]}}.
+        # Trước đây hàm này trả {"qid": [...]} (thiếu bọc "answer") ->
+        # scoring.py của BTC sẽ lỗi vì cố đọc predictions[qid]['answer'].
+        submission[str(qid)] = {"answer": top_docs}
     
     logger.info(f" Đã tạo submission với {len(submission)} queries")
     return submission

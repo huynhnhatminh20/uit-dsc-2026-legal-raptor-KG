@@ -33,6 +33,39 @@ RRF_K = 60
 MAX_CANDIDATES = 50
 EMBEDDING_MODEL = "BAAI/bge-m3"
 
+# ============ CACHE (module-level) ============
+# QUAN TRỌNG: trước đây get_dense_scores() load lại SentenceTransformer từ
+# đầu MỖI câu hỏi (rất chậm), get_bm25_scores()/get_graph_scores() cũng
+# unpickle lại BM25/Graph từ đĩa MỖI câu hỏi. Với ~1000 câu hỏi, việc này
+# khiến toàn bộ vòng inference chậm hơn hàng chục-hàng trăm lần so với cần
+# thiết. Cache 1 lần, dùng lại cho tất cả câu hỏi trong cùng session.
+_DENSE_EMBEDDER_CACHE = None
+_GRAPH_CACHE = None
+_BM25_CACHE = None
+
+
+def _get_dense_embedder():
+    global _DENSE_EMBEDDER_CACHE
+    if _DENSE_EMBEDDER_CACHE is None:
+        _DENSE_EMBEDDER_CACHE = SentenceTransformer(EMBEDDING_MODEL)
+    return _DENSE_EMBEDDER_CACHE
+
+
+def _get_graph_cached():
+    global _GRAPH_CACHE
+    if _GRAPH_CACHE is None and GRAPH_CKPT.exists():
+        with open(GRAPH_CKPT, "rb") as f:
+            _GRAPH_CACHE = pickle.load(f)
+    return _GRAPH_CACHE
+
+
+def _get_bm25_cached():
+    global _BM25_CACHE
+    if _BM25_CACHE is None and BM25_CKPT.exists():
+        with open(BM25_CKPT, "rb") as f:
+            _BM25_CACHE = pickle.load(f)
+    return _BM25_CACHE
+
 
 # ============ HÀM CHÍNH ============
 
@@ -200,18 +233,42 @@ def hybrid_retrieve(query: str, top_k: int = 50) -> List[Dict]:
         
         rrf_scores[doc_id] = score
     
-    # Sắp xếp và trả về top_k
-    sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)[:top_k]
-    
+    # QUAN TRỌNG: các "doc_id" ở trên thực chất là ID của NODE (chunk hoặc
+    # cluster RAPTOR, VD "115374_a3_c22"), KHÔNG PHẢI document_id mà BTC
+    # yêu cầu (VD "115374"). Phải tra ngược về document_id gốc bằng
+    # get_node_doc_map() (chỉ node level 0 mới có map hợp lệ; cluster node
+    # gộp nhiều văn bản nên bị loại vì không có 1 document_id duy nhất).
+    try:
+        from member_a import get_node_doc_map
+        node_doc_map = get_node_doc_map()
+    except Exception as e:
+        logger.warning(f" Không lấy được node_doc_map: {e}")
+        node_doc_map = {}
+
+    # Sắp xếp theo điểm RRF (duyệt nhiều hơn top_k vì sẽ bị lọc bớt)
+    sorted_node_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+
     result = []
-    for doc_id in sorted_ids:
+    seen_doc_ids = set()
+    for node_id in sorted_node_ids:
+        real_doc_id = node_doc_map.get(node_id)
+        if real_doc_id is None:
+            # Node cluster (level 1/2) hoặc không xác định được văn bản gốc -> bỏ qua
+            continue
+        if real_doc_id in seen_doc_ids:
+            # Đã có 1 chunk khác của cùng văn bản này trong candidate rồi,
+            # không cần thêm bản trùng (giữ điểm/ text của chunk có rank cao nhất)
+            continue
+        seen_doc_ids.add(real_doc_id)
         result.append({
-            "id": doc_id,
-            "text": node_dict.get(doc_id, ""),
-            "score": rrf_scores.get(doc_id, 0)
+            "id": real_doc_id,
+            "text": node_dict.get(node_id, ""),
+            "score": rrf_scores.get(node_id, 0)
         })
-    
-    logger.info(f" Found {len(result)} candidates")
+        if len(result) >= top_k:
+            break
+
+    logger.info(f" Found {len(result)} candidates (đã quy về document_id, khử trùng lặp)")
     return result
 
 
@@ -221,11 +278,9 @@ def get_bm25_scores(query: str, top_k: int) -> Dict[str, float]:
     """Lấy BM25 scores với tokenization nâng cao"""
     bm25_scores = {}
     
-    if not BM25_CKPT.exists():
+    bm25_data = _get_bm25_cached()
+    if bm25_data is None:
         return bm25_scores
-    
-    with open(BM25_CKPT, "rb") as f:
-        bm25_data = pickle.load(f)
     
     bm25 = bm25_data["bm25"]
     doc_ids = bm25_data["doc_ids"]
@@ -256,7 +311,7 @@ def get_dense_scores(query: str, vector_store, top_k: int) -> Dict[str, float]:
         return dense_scores
     
     try:
-        embedder = SentenceTransformer(EMBEDDING_MODEL)
+        embedder = _get_dense_embedder()
         q_emb = embedder.encode([query])
         
         index = vector_store["index"]
@@ -284,13 +339,11 @@ def get_graph_scores(query: str, top_k: int) -> Dict[str, float]:
     """Lấy graph retrieval scores với multi-hop"""
     graph_scores = defaultdict(float)
     
-    if not GRAPH_CKPT.exists():
+    G = _get_graph_cached()
+    if G is None:
         return dict(graph_scores)
     
     try:
-        with open(GRAPH_CKPT, "rb") as f:
-            G = pickle.load(f)
-        
         # Trích xuất entities từ query
         entities = extract_entities_advanced(query)
         
@@ -313,6 +366,15 @@ def get_graph_scores(query: str, top_k: int) -> Dict[str, float]:
                     for neighbor in G.neighbors(node_id):
                         graph_scores[neighbor] += 0.5
         
+        # QUAN TRỌNG: chỉ giữ lại node kiểu "document" (= chunk level 0/1/2).
+        # Node kiểu "entity" (VD "entity_Bộ Y tế_AGENCY") không map được về
+        # 1 document_id cụ thể -> nếu lọt vào candidate list sẽ vừa vô ích
+        # vừa làm reranker/submission nhận ID rác.
+        graph_scores = {
+            node_id: score for node_id, score in graph_scores.items()
+            if G.nodes[node_id].get("type") == "document"
+        }
+
         # Lấy top_k
         sorted_scores = sorted(graph_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
         return dict(sorted_scores)
