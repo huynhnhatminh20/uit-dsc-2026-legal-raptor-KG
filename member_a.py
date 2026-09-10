@@ -73,7 +73,7 @@ def build_raptor(legal=None, emb=None):
     # 5. Tạo embeddings cho chunks
     texts = [c["text"] for c in chunks]
     logger.info("   Encoding chunks...")
-    embeddings = embedder.encode(texts, show_progress_bar=True)
+    embeddings = embedder.encode(texts)
     
     # 6. Xây dựng cây RAPTOR (phiên bản tối ưu)
     tree = build_raptor_tree_optimized(chunks, embeddings, embedder, legal)
