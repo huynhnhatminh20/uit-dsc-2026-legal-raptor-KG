@@ -589,7 +589,7 @@ def load_documents(data_dir: str = "data_legalir") -> List[Dict]:
         data_dir,
         "/kaggle/input/legalir",
         "/kaggle/input/legalir-dataset",
-        "/kaggle/input/selected-contexts",
+        "/kaggle/input/selected-contexts/selected-contexts",
         "/content/selected-contexts",
         "../data_legalir",
     ]
