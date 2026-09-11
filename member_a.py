@@ -6,6 +6,7 @@ import os
 import json
 import pickle
 import pathlib
+import shutil
 from typing import List, Dict, Optional, Tuple, Any
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -18,18 +19,111 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+# ============ TỰ ĐỘNG KHÔI PHỤC CHECKPOINT TỪ /kaggle/input ============
+
+def _restore_checkpoint_from_input(folder_name: str, ckpt_dir: pathlib.Path):
+    """
+    Nếu bạn đã Add Data một Dataset chứa checkpoint cũ (tải checkpoint về
+    máy từ 1 lần chạy trước, upload lại thành Dataset, gắn vào notebook qua
+    "Add Data"), hàm này tự tìm thư mục con tên đúng "{folder_name}" bên
+    trong /kaggle/input và copy các file còn thiếu vào /kaggle/working,
+    để build_...() nhận ra và resume tiếp mà không cần thao tác gì thêm.
+
+    Chỉ copy file NÀO CHƯA CÓ ở ckpt_dir (không ghi đè checkpoint mới hơn
+    đang có sẵn trong session hiện tại).
+    """
+    input_root = pathlib.Path("/kaggle/input")
+    if not input_root.exists():
+        return
+
+    try:
+        for dataset_dir in input_root.iterdir():
+            if not dataset_dir.is_dir():
+                continue
+            # Tìm thư mục "{folder_name}" ngay trong dataset, hoặc lồng thêm 1 cấp
+            candidates = [dataset_dir / folder_name] + list(dataset_dir.glob(f"*/{folder_name}"))
+            for src in candidates:
+                if src.is_dir():
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    copied = 0
+                    for f in src.iterdir():
+                        dst = ckpt_dir / f.name
+                        if not dst.exists():
+                            shutil.copy2(f, dst)
+                            copied += 1
+                    if copied:
+                        logger.info(f" Đã khôi phục {copied} file checkpoint từ {src} -> {ckpt_dir}")
+                    return
+    except Exception as e:
+        logger.warning(f" Lỗi khi quét /kaggle/input để khôi phục checkpoint: {e}")
+
+
 # ============ CHECKPOINT CONFIG ============
 CKPT_DIR = pathlib.Path("/kaggle/working/A_checkpoint")
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
+_restore_checkpoint_from_input("A_checkpoint", CKPT_DIR)
 RAPTOR_CKPT = CKPT_DIR / "raptor_tree.pkl"
 VECTOR_CKPT = CKPT_DIR / "vector_store.pkl"
 CHUNK_CKPT = CKPT_DIR / "chunks.pkl"
+# Checkpoint riêng cho bước encode (GPU, tốn thời gian nhất, dễ bị Kaggle
+# ngắt giữa chừng nhất) -> lưu theo batch để có thể resume, không phải
+# encode lại từ đầu nếu mất kết nối/hết giờ giữa chừng.
+EMBED_CKPT_CHUNKS = CKPT_DIR / "embed_chunks.pkl"
+EMBED_CKPT_NODES = CKPT_DIR / "embed_nodes.pkl"
 
 # ============ CONSTANTS ============
 CHUNK_SIZE = 512
 OVERLAP = 50
 EMBEDDING_MODEL = "BAAI/bge-m3"
 CLUSTER_THRESHOLD = 0.7
+
+
+# ============ ENCODE CÓ CHECKPOINT ============
+
+def encode_with_checkpoint(embedder, texts: List[str], ckpt_path: pathlib.Path,
+                            batch_size: int = 256, desc: str = "Encoding") -> np.ndarray:
+    """
+    Encode văn bản theo từng batch và LƯU CHECKPOINT SAU MỖI BATCH.
+
+    Đây là bước tốn thời gian nhất (chạy GPU trên hàng trăm nghìn chunks) và
+    cũng là bước dễ bị Kaggle ngắt session giữa chừng nhất. Trước đây bước
+    này chỉ chạy embedder.encode(texts) một lần duy nhất, kết quả nằm hoàn
+    toàn trong RAM -> nếu bị ngắt giữa chừng thì MẤT TRẮNG toàn bộ embeddings
+    đã tính, phải encode lại từ đầu.
+
+    Hàm này thay thế bằng cách encode từng batch nhỏ, lưu checkpoint (kèm vị
+    trí đã encode tới đâu) sau mỗi batch. Nếu session bị ngắt và chạy lại,
+    sẽ tự động resume từ đúng batch còn dang dở thay vì bắt đầu lại từ 0.
+    """
+    if ckpt_path.exists():
+        with open(ckpt_path, "rb") as f:
+            state = pickle.load(f)
+        done_embeddings = state["embeddings"]
+        start_idx = state["done_count"]
+
+        if start_idx >= len(texts):
+            logger.info(f" Đã encode đủ {len(texts)} văn bản, load checkpoint: {ckpt_path}")
+            return np.array(done_embeddings)
+
+        logger.info(f" Resume encoding từ vị trí {start_idx}/{len(texts)} (checkpoint: {ckpt_path})")
+    else:
+        done_embeddings = []
+        start_idx = 0
+
+    for i in tqdm(range(start_idx, len(texts), batch_size), desc=desc):
+        batch = texts[i:i + batch_size]
+        batch_emb = embedder.encode(batch)
+        done_embeddings.extend(list(batch_emb))
+
+        # Lưu checkpoint ngay sau mỗi batch, không đợi encode xong hết
+        with open(ckpt_path, "wb") as f:
+            pickle.dump({
+                "embeddings": done_embeddings,
+                "done_count": i + len(batch),
+            }, f)
+
+    return np.array(done_embeddings)
 
 
 # ============ HÀM CHÍNH ============
@@ -71,10 +165,11 @@ def build_raptor(legal=None, emb=None):
     chunks = chunk_documents_optimized(documents)
     logger.info(f" Đã tạo {len(chunks)} chunks")
     
-    # 5. Tạo embeddings cho chunks
+    # 5. Tạo embeddings cho chunks (có checkpoint theo batch, resume được
+    #    nếu bị ngắt giữa chừng thay vì encode lại từ đầu)
     texts = [c["text"] for c in chunks]
     logger.info("   Encoding chunks...")
-    embeddings = embedder.encode(texts)
+    embeddings = encode_with_checkpoint(embedder, texts, EMBED_CKPT_CHUNKS, desc="Encoding chunks")
     
     # 6. Xây dựng cây RAPTOR (phiên bản tối ưu)
     tree = build_raptor_tree_optimized(chunks, embeddings, embedder, legal)
@@ -83,7 +178,12 @@ def build_raptor(legal=None, emb=None):
     with open(RAPTOR_CKPT, "wb") as f:
         pickle.dump(tree, f)
     logger.info(f" RAPTOR checkpoint lưu tại {RAPTOR_CKPT}")
-    
+
+    # Đã build xong tree -> không cần checkpoint embedding trung gian nữa,
+    # xóa để tránh chiếm dung lượng ổ đĩa Kaggle không cần thiết.
+    if EMBED_CKPT_CHUNKS.exists():
+        EMBED_CKPT_CHUNKS.unlink()
+
     return tree
 
 
@@ -135,9 +235,10 @@ def build_vector_store(emb=None):
         node_ids.append(node["id"])
         metadata_list.append(node.get("metadata", {}))
     
-    # 5. Tạo embeddings
+    # 5. Tạo embeddings (có checkpoint theo batch, resume được nếu bị ngắt
+    #    giữa chừng thay vì encode lại từ đầu)
     logger.info(f"   Encoding {len(texts)} nodes...")
-    embeddings = embedder.encode(texts)
+    embeddings = encode_with_checkpoint(embedder, texts, EMBED_CKPT_NODES, desc="Encoding nodes")
     
     # 6. Tạo FAISS index (IVF cho tốc độ)
     dim = embeddings.shape[1]
@@ -167,7 +268,11 @@ def build_vector_store(emb=None):
     with open(VECTOR_CKPT, "wb") as f:
         pickle.dump(vector_store, f)
     logger.info(f" Vector Store checkpoint lưu tại {VECTOR_CKPT}")
-    
+
+    # Đã build xong vector store -> xóa checkpoint embedding trung gian
+    if EMBED_CKPT_NODES.exists():
+        EMBED_CKPT_NODES.unlink()
+
     return vector_store
 
 

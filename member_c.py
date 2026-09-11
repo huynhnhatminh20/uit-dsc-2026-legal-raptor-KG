@@ -6,6 +6,7 @@ import os
 import json
 import pickle
 import pathlib
+import shutil
 from typing import List, Dict, Optional, Tuple, Any
 import numpy as np
 import torch
@@ -17,12 +18,49 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+# ============ TỰ ĐỘNG KHÔI PHỤC CHECKPOINT TỪ /kaggle/input ============
+
+def _restore_checkpoint_from_input(folder_name: str, ckpt_dir: pathlib.Path):
+    """Xem giải thích chi tiết ở member_a.py - tự tìm và copy checkpoint đã
+    Add Data từ /kaggle/input vào /kaggle/working, chỉ copy file còn thiếu."""
+    input_root = pathlib.Path("/kaggle/input")
+    if not input_root.exists():
+        return
+
+    try:
+        for dataset_dir in input_root.iterdir():
+            if not dataset_dir.is_dir():
+                continue
+            candidates = [dataset_dir / folder_name] + list(dataset_dir.glob(f"*/{folder_name}"))
+            for src in candidates:
+                if src.is_dir():
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    copied = 0
+                    for f in src.iterdir():
+                        dst = ckpt_dir / f.name
+                        if not dst.exists():
+                            shutil.copy2(f, dst)
+                            copied += 1
+                    if copied:
+                        logger.info(f" Đã khôi phục {copied} file checkpoint từ {src} -> {ckpt_dir}")
+                    return
+    except Exception as e:
+        logger.warning(f" Lỗi khi quét /kaggle/input để khôi phục checkpoint: {e}")
+
+
 # ============ CHECKPOINT CONFIG ============
 CKPT_DIR = pathlib.Path("/kaggle/working/C_checkpoint")
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
+_restore_checkpoint_from_input("C_checkpoint", CKPT_DIR)
 RERANKER_CKPT = CKPT_DIR / "reranker.pkl"
 LLM_CKPT = CKPT_DIR / "legal_llm.pkl"
 EVAL_CKPT = CKPT_DIR / "eval_fn.pkl"
+# Checkpoint TẠM cho vòng lặp tạo submission (retrieve + rerank từng query
+# có thể rất chậm nếu có hàng trăm/nghìn câu hỏi) -> lưu định kỳ để resume,
+# không phải chạy lại từ query đầu tiên nếu bị ngắt giữa chừng.
+SUBMISSION_CKPT = CKPT_DIR / "submission_partial.pkl"
+SUBMISSION_SAVE_INTERVAL = 20  # lưu checkpoint tạm sau mỗi 20 queries
 
 # ============ CONSTANTS ============
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -388,13 +426,25 @@ def generate_submission(
     if reranker is None:
         reranker = get_reranker()
     
+    # Resume từ checkpoint tạm nếu có (từ lần chạy trước bị ngắt giữa chừng)
     submission = {}
+    if SUBMISSION_CKPT.exists():
+        with open(SUBMISSION_CKPT, "rb") as f:
+            submission = pickle.load(f)
+        logger.info(f" Resume submission từ checkpoint: đã có {len(submission)} queries")
+
     total = len(queries)
     
     logger.info(f" Đang tạo submission cho {total} queries...")
     
     for i, item in enumerate(tqdm(queries, desc="Processing queries")):
         qid = item.get("id", f"q_{i}")
+        qid_str = str(qid)
+
+        # Đã xử lý xong ở lần chạy trước -> bỏ qua, không làm lại
+        if qid_str in submission:
+            continue
+
         query = item.get("text", item.get("question", ""))
         
         # Lấy candidates từ retrieval
@@ -405,7 +455,17 @@ def generate_submission(
         # QUAN TRỌNG: định dạng BTC yêu cầu là {"qid": {"answer": [...]}}.
         # Trước đây hàm này trả {"qid": [...]} (thiếu bọc "answer") ->
         # scoring.py của BTC sẽ lỗi vì cố đọc predictions[qid]['answer'].
-        submission[str(qid)] = {"answer": top_docs}
+        submission[qid_str] = {"answer": top_docs}
+
+        # Lưu checkpoint tạm định kỳ, không đợi xử lý hết mới lưu
+        if (i + 1) % SUBMISSION_SAVE_INTERVAL == 0:
+            with open(SUBMISSION_CKPT, "wb") as f:
+                pickle.dump(submission, f)
+            logger.info(f"    Checkpoint submission tạm: {len(submission)}/{total} queries")
+
+    # Lưu lần cuối để chắc chắn không sót query nào
+    with open(SUBMISSION_CKPT, "wb") as f:
+        pickle.dump(submission, f)
     
     logger.info(f" Đã tạo submission với {len(submission)} queries")
     return submission

@@ -6,6 +6,7 @@ import os
 import json
 import pickle
 import pathlib
+import shutil
 from typing import List, Dict, Optional, Tuple, Any
 import numpy as np
 import networkx as nx
@@ -20,13 +21,50 @@ from collections import defaultdict
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+# ============ TỰ ĐỘNG KHÔI PHỤC CHECKPOINT TỪ /kaggle/input ============
+
+def _restore_checkpoint_from_input(folder_name: str, ckpt_dir: pathlib.Path):
+    """Xem giải thích chi tiết ở member_a.py - tự tìm và copy checkpoint đã
+    Add Data từ /kaggle/input vào /kaggle/working, chỉ copy file còn thiếu."""
+    input_root = pathlib.Path("/kaggle/input")
+    if not input_root.exists():
+        return
+
+    try:
+        for dataset_dir in input_root.iterdir():
+            if not dataset_dir.is_dir():
+                continue
+            candidates = [dataset_dir / folder_name] + list(dataset_dir.glob(f"*/{folder_name}"))
+            for src in candidates:
+                if src.is_dir():
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    copied = 0
+                    for f in src.iterdir():
+                        dst = ckpt_dir / f.name
+                        if not dst.exists():
+                            shutil.copy2(f, dst)
+                            copied += 1
+                    if copied:
+                        logger.info(f" Đã khôi phục {copied} file checkpoint từ {src} -> {ckpt_dir}")
+                    return
+    except Exception as e:
+        logger.warning(f" Lỗi khi quét /kaggle/input để khôi phục checkpoint: {e}")
+
+
 # ============ CHECKPOINT CONFIG ============
 CKPT_DIR = pathlib.Path("/kaggle/working/B_checkpoint")
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
+_restore_checkpoint_from_input("B_checkpoint", CKPT_DIR)
 GRAPH_CKPT = CKPT_DIR / "graph.pkl"
 BM25_CKPT = CKPT_DIR / "bm25.pkl"
 ENTITY_CKPT = CKPT_DIR / "entities.pkl"
 RELATION_CKPT = CKPT_DIR / "relations.pkl"
+# Checkpoint TẠM cho vòng lặp build graph (đặc biệt tốn thời gian khi có
+# LLM entity/relation extraction cho từng node) -> lưu định kỳ để resume,
+# tránh mất hết tiến trình nếu Kaggle ngắt giữa chừng.
+GRAPH_PARTIAL_CKPT = CKPT_DIR / "graph_partial.pkl"
+GRAPH_CKPT_INTERVAL = 200  # lưu checkpoint tạm sau mỗi 200 nodes
 
 # ============ CONSTANTS ============
 RRF_K = 60
@@ -102,13 +140,24 @@ def build_graph(legal=None):
     logger.info(f" Có {len(nodes)} nodes từ RAPTOR")
 
     
-    # 3. Xây dựng Graph với LLM
-    G = build_knowledge_graph_optimized(nodes, legal)
+    # 3. Xây dựng Graph với LLM (resume từ checkpoint tạm nếu có, để không
+    #    phải chạy lại từ node đầu tiên nếu bị ngắt giữa chừng)
+    resume_state = None
+    if GRAPH_PARTIAL_CKPT.exists():
+        logger.info(f" Tìm thấy checkpoint tạm, resume xây Graph: {GRAPH_PARTIAL_CKPT}")
+        with open(GRAPH_PARTIAL_CKPT, "rb") as f:
+            resume_state = pickle.load(f)
+
+    G = build_knowledge_graph_optimized(nodes, legal, resume_state=resume_state)
     
     # 4. Lưu checkpoint
     with open(GRAPH_CKPT, "wb") as f:
         pickle.dump(G, f)
     logger.info(f" Graph checkpoint lưu tại {GRAPH_CKPT}")
+
+    # Đã build xong graph hoàn chỉnh -> xóa checkpoint tạm, không cần nữa
+    if GRAPH_PARTIAL_CKPT.exists():
+        GRAPH_PARTIAL_CKPT.unlink()
     
     return G
 
@@ -393,18 +442,34 @@ def get_graph_scores(query: str, top_k: int) -> Dict[str, float]:
 
 # ============ TỐI ƯU KNOWLEDGE GRAPH ============
 
-def build_knowledge_graph_optimized(nodes: List[Dict], legal=None) -> nx.Graph:
+def build_knowledge_graph_optimized(nodes: List[Dict], legal=None, resume_state: Optional[Dict] = None) -> nx.Graph:
     """
     Xây dựng Knowledge Graph từ nodes với LLM entity extraction
+
+    Args:
+        nodes: Danh sách RAPTOR nodes
+        legal: Legal LLM (optional)
+        resume_state: Nếu có (dict {"graph", "all_entities", "all_relations",
+            "processed_count"}), sẽ resume từ node thứ processed_count thay
+            vì xây lại từ đầu. Dùng khi lần chạy trước bị ngắt giữa chừng.
     """
-    logger.info(" Building Knowledge Graph tối ưu...")
-    G = nx.Graph()
-    
-    all_entities = []
-    all_relations = []
+    if resume_state is not None:
+        G = resume_state["graph"]
+        all_entities = resume_state["all_entities"]
+        all_relations = resume_state["all_relations"]
+        start_idx = resume_state["processed_count"]
+        logger.info(f" Resume xây Knowledge Graph từ node {start_idx}/{len(nodes)}...")
+    else:
+        logger.info(" Building Knowledge Graph tối ưu...")
+        G = nx.Graph()
+        all_entities = []
+        all_relations = []
+        start_idx = 0
     
     # Thêm các document nodes
-    for node in tqdm(nodes, desc="Adding nodes"):
+    for idx in tqdm(range(start_idx, len(nodes)), desc="Adding nodes",
+                     initial=start_idx, total=len(nodes)):
+        node = nodes[idx]
         node_id = node["id"]
         text = node["text"]
         level = node.get("level", 0)
@@ -436,6 +501,19 @@ def build_knowledge_graph_optimized(nodes: List[Dict], legal=None) -> nx.Graph:
                           value=entity['value'],
                           metadata=entity.get('metadata', {}))
             G.add_edge(node_id, entity_id, relation="contains", weight=1.0)
+
+        # Lưu checkpoint TẠM định kỳ. Đây là vòng lặp tốn thời gian nhất
+        # (đặc biệt khi có LLM generate cho từng node) và dễ bị Kaggle ngắt
+        # giữa chừng nhất -> nếu không có checkpoint tạm, mất là mất sạch.
+        if (idx + 1) % GRAPH_CKPT_INTERVAL == 0:
+            with open(GRAPH_PARTIAL_CKPT, "wb") as f:
+                pickle.dump({
+                    "graph": G,
+                    "all_entities": all_entities,
+                    "all_relations": all_relations,
+                    "processed_count": idx + 1,
+                }, f)
+            logger.info(f"    Checkpoint tạm Graph tại node {idx + 1}/{len(nodes)}")
     
     # Thêm relation edges
     for rel in all_relations:
