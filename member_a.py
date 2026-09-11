@@ -131,11 +131,11 @@ def encode_with_checkpoint(embedder, texts: List[str], ckpt_path: pathlib.Path,
 def build_raptor(legal=None, emb=None):
     """
     Xây dựng RAPTOR tree với checkpoint
-    
+
     Args:
         legal: Legal LLM (VLSP2025-LegalSML/qwen3-4b-legal-pretrain)
         emb: Embedding model (BAAI/bge-m3)
-    
+
     Returns:
         Dict: RAPTOR tree với nodes và levels
     """
@@ -143,37 +143,46 @@ def build_raptor(legal=None, emb=None):
     if RAPTOR_CKPT.exists():
         logger.info(f" Load RAPTOR từ checkpoint: {RAPTOR_CKPT}")
         with open(RAPTOR_CKPT, "rb") as f:
-            return pickle.load(f)
-    
+            tree = pickle.load(f)
+
+        # Chỉ coi checkpoint là hoàn chỉnh khi đã có level 2.
+        # Nếu mới có level 0/1 thì tiếp tục resume các level còn thiếu.
+        levels = {x.get("level") for x in tree.get("levels", [])}
+        if 2 in levels:
+            logger.info(" RAPTOR checkpoint hoàn chỉnh -> load và return")
+            return tree
+
+        logger.info(f" RAPTOR checkpoint chưa hoàn chỉnh {sorted(levels)} -> resume")
+
     logger.info(" Đang xây dựng RAPTOR tree...")
-    
+
     # 2. Chuẩn bị embedder
     if emb is not None:
         embedder = emb
     else:
         logger.info("   Loading BAAI/bge-m3...")
         embedder = SentenceTransformer(EMBEDDING_MODEL)
-    
+
     # 3. Đọc dữ liệu
     documents = load_documents()
     if not documents:
         logger.warning(" Không có dữ liệu! Dùng sample documents.")
         documents = create_sample_documents()
 
-    
+
     # 4. Chunk văn bản (phiên bản tối ưu)
     chunks = chunk_documents_optimized(documents)
     logger.info(f" Đã tạo {len(chunks)} chunks")
-    
+
     # 5. Tạo embeddings cho chunks (có checkpoint theo batch, resume được
     #    nếu bị ngắt giữa chừng thay vì encode lại từ đầu)
     texts = [c["text"] for c in chunks]
     logger.info("   Encoding chunks...")
     embeddings = encode_with_checkpoint(embedder, texts, EMBED_CKPT_CHUNKS, desc="Encoding chunks")
-    
+
     # 6. Xây dựng cây RAPTOR (phiên bản tối ưu)
     tree = build_raptor_tree_optimized(chunks, embeddings, embedder, legal)
-    
+
     # 7. Lưu checkpoint cuối cùng
     with open(RAPTOR_CKPT, "wb") as f:
         pickle.dump(tree, f)
@@ -472,26 +481,64 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
     - 3 levels
     """
     logger.info(" Xây dựng RAPTOR tree tối ưu...")
-    
-    tree = {
-        "nodes": [],
-        "levels": []
-    }
-    
-    # ============ LEVEL 0: Chunks gốc ============
-    level_0 = chunks.copy()
-    tree["nodes"].extend(level_0)
-    tree["levels"].append({"level": 0, "node_ids": [n["id"] for n in level_0]})
-    logger.info(f"   Level 0: {len(level_0)} nodes")
-    
-    with open(RAPTOR_CKPT, "wb") as f:
-        pickle.dump(tree, f)
-    logger.info("    Checkpoint saved (level 0)")
-    
+
+    # ============ LOAD / RESUME TREE ============
+    if RAPTOR_CKPT.exists():
+        logger.info(f" Resume RAPTOR từ checkpoint: {RAPTOR_CKPT}")
+
+        with open(RAPTOR_CKPT, "rb") as f:
+            tree = pickle.load(f)
+
+        completed_levels = {
+            x.get("level") for x in tree.get("levels", [])
+        }
+
+        logger.info(
+            f" Các level đã hoàn thành: {sorted(completed_levels)}"
+        )
+    else:
+        tree = {
+            "nodes": [],
+            "levels": []
+        }
+        completed_levels = set()
+
+    # ============ LEVEL 0 ============
+    if 0 not in completed_levels:
+        level_0 = chunks.copy()
+
+        tree["nodes"].extend(level_0)
+        tree["levels"].append({
+            "level": 0,
+            "node_ids": [n["id"] for n in level_0]
+        })
+
+        logger.info(f"   Level 0: {len(level_0)} nodes")
+
+        with open(RAPTOR_CKPT, "wb") as f:
+            pickle.dump(tree, f)
+
+        logger.info("    Checkpoint saved (level 0)")
+
+        completed_levels.add(0)
+
     # ============ LEVEL 1: Clusters ============
-    if len(chunks) > 5:
+    level_1 = []
+
+    # Nếu level 1 đã có trong checkpoint, khôi phục các node level 1
+    # từ tree để có thể tiếp tục xây level 2.
+    if 1 in completed_levels:
+        level_1_ids = next(
+            (x.get("node_ids", []) for x in tree.get("levels", [])
+             if x.get("level") == 1),
+            []
+        )
+        node_by_id = {n.get("id"): n for n in tree.get("nodes", [])}
+        level_1 = [node_by_id[nid] for nid in level_1_ids if nid in node_by_id]
+
+    if len(chunks) > 5 and 1 not in completed_levels:
         logger.info("   Building level 1 clusters...")
-        
+
         try:
             from sklearn.cluster import MiniBatchKMeans
 
@@ -515,19 +562,19 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
                 random_state=42,
             )
             labels = clustering.fit_predict(emb_normalized)
-            
+
             level_1 = []
             for cluster_idx in range(n_clusters):
                 cluster_indices = [i for i, label in enumerate(labels) if label == cluster_idx]
                 cluster_chunks = [chunks[i] for i in cluster_indices]
                 cluster_texts = [c["text"] for c in cluster_chunks]
-                
+
                 if len(cluster_texts) > 1:
                     if legal_llm is not None:
                         summary = summarize_cluster_with_llm(cluster_texts, legal_llm)
                     else:
                         summary = summarize_cluster_advanced(cluster_texts, embedder)
-                    
+
                     level_1.append({
                         "id": f"cluster_{cluster_idx}",
                         "text": summary,
@@ -541,69 +588,81 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
                 elif cluster_texts:
                     idx = cluster_indices[0]
                     level_1.append(chunks[idx])
-            
+
             tree["nodes"].extend(level_1)
             tree["levels"].append({"level": 1, "node_ids": [n["id"] for n in level_1]})
             logger.info(f"   Level 1: {len(level_1)} nodes")
-            
+
             with open(RAPTOR_CKPT, "wb") as f:
                 pickle.dump(tree, f)
             logger.info("   Checkpoint saved (level 1)")
-            
-            # ============ LEVEL 2: Clusters of clusters ============
-            if len(level_1) > 5:
-                logger.info("   Building level 2 clusters...")
-                
-                level_1_texts = [n["text"] for n in level_1]
-                level_1_embeddings = embedder.encode(level_1_texts)
-                
-                n_clusters_2 = min(max(2, len(level_1) // 3), 10)
-                l1_f32 = level_1_embeddings.astype('float32')
-                l1_norms = np.linalg.norm(l1_f32, axis=1, keepdims=True)
-                l1_norms[l1_norms == 0] = 1.0
-                l1_normalized = l1_f32 / l1_norms
-                clustering_2 = MiniBatchKMeans(
-                    n_clusters=n_clusters_2,
-                    batch_size=min(2048, len(level_1)),
-                    n_init=3,
-                    random_state=42,
-                )
-                labels_2 = clustering_2.fit_predict(l1_normalized)
-                
-                level_2 = []
-                for cluster_idx in range(n_clusters_2):
-                    cluster_indices = [i for i, label in enumerate(labels_2) if label == cluster_idx]
-                    cluster_nodes = [level_1[i] for i in cluster_indices]
-                    cluster_texts = [n["text"] for n in cluster_nodes]
-                    
-                    if len(cluster_texts) > 1:
-                        if legal_llm is not None:
-                            summary = summarize_cluster_with_llm(cluster_texts, legal_llm)
-                        else:
-                            summary = summarize_cluster_advanced(cluster_texts, embedder)
-                        
-                        level_2.append({
-                            "id": f"cluster_level2_{cluster_idx}",
-                            "text": summary,
-                            "level": 2,
-                            "metadata": {
-                                "cluster_size": len(cluster_texts),
-                                "children": [n["id"] for n in cluster_nodes]
-                            }
-                        })
-                
-                if level_2:
-                    tree["nodes"].extend(level_2)
-                    tree["levels"].append({"level": 2, "node_ids": [n["id"] for n in level_2]})
-                    logger.info(f"   Level 2: {len(level_2)} nodes")
-                    
-                    with open(RAPTOR_CKPT, "wb") as f:
-                        pickle.dump(tree, f)
-                    logger.info("   Checkpoint saved (level 2)")
-                
+
+            completed_levels.add(1)
+
         except Exception as e:
             logger.warning(f" Clustering failed: {e}")
-    
+
+    # ============ LEVEL 2: Clusters of clusters ============
+    # Đặt ngoài block level 1 để khi resume từ checkpoint level 1,
+    # level 2 vẫn có thể tiếp tục chạy.
+    if len(level_1) > 5 and 2 not in completed_levels:
+        logger.info("   Building level 2 clusters...")
+
+        try:
+            from sklearn.cluster import MiniBatchKMeans
+
+            level_1_texts = [n["text"] for n in level_1]
+            level_1_embeddings = embedder.encode(level_1_texts)
+
+            n_clusters_2 = min(max(2, len(level_1) // 3), 10)
+            l1_f32 = level_1_embeddings.astype('float32')
+            l1_norms = np.linalg.norm(l1_f32, axis=1, keepdims=True)
+            l1_norms[l1_norms == 0] = 1.0
+            l1_normalized = l1_f32 / l1_norms
+            clustering_2 = MiniBatchKMeans(
+                n_clusters=n_clusters_2,
+                batch_size=min(2048, len(level_1)),
+                n_init=3,
+                random_state=42,
+            )
+            labels_2 = clustering_2.fit_predict(l1_normalized)
+
+            level_2 = []
+            for cluster_idx in range(n_clusters_2):
+                cluster_indices = [i for i, label in enumerate(labels_2) if label == cluster_idx]
+                cluster_nodes = [level_1[i] for i in cluster_indices]
+                cluster_texts = [n["text"] for n in cluster_nodes]
+
+                if len(cluster_texts) > 1:
+                    if legal_llm is not None:
+                        summary = summarize_cluster_with_llm(cluster_texts, legal_llm)
+                    else:
+                        summary = summarize_cluster_advanced(cluster_texts, embedder)
+
+                    level_2.append({
+                        "id": f"cluster_level2_{cluster_idx}",
+                        "text": summary,
+                        "level": 2,
+                        "metadata": {
+                            "cluster_size": len(cluster_texts),
+                            "children": [n["id"] for n in cluster_nodes]
+                        }
+                    })
+
+            if level_2:
+                tree["nodes"].extend(level_2)
+                tree["levels"].append({"level": 2, "node_ids": [n["id"] for n in level_2]})
+                logger.info(f"   Level 2: {len(level_2)} nodes")
+
+                with open(RAPTOR_CKPT, "wb") as f:
+                    pickle.dump(tree, f)
+                logger.info("   Checkpoint saved (level 2)")
+
+                completed_levels.add(2)
+
+        except Exception as e:
+            logger.warning(f" Clustering level 2 failed: {e}")
+
     logger.info(f" RAPTOR tree completed: {len(tree['nodes'])} nodes, {len(tree['levels'])} levels")
     return tree
 
@@ -683,6 +742,13 @@ def load_documents(data_dir: str = "data_legalir") -> List[Dict]:
     (không phải 1 file = nhiều văn bản, và field nội dung là "passage",
     không phải "content"/"text").
 
+    LƯU Ý: tham số data_dir cần được truyền đúng path dataset trên máy/
+    Kaggle của người chạy (vd "/kaggle/input/ten-dataset-cua-ban"). KHÔNG
+    auto-dò trong /kaggle/input, vì chỉ dựa vào "có file .json" là quá
+    lỏng, dễ chọn nhầm dataset khác nếu notebook gắn nhiều dataset cùng
+    lúc. Mỗi người trong nhóm tự sửa data_dir (hoặc truyền qua tham số khi
+    gọi build_raptor(...)) cho khớp đúng dataset họ đã Add Data.
+
     Hàm này đọc cả 3 khả năng để không bị vỡ nếu định dạng thay đổi:
       1) File phẳng 1-văn-bản/file (định dạng thật của BTC) — ưu tiên.
       2) File dạng {"doc_id": {...}, ...} (nhiều văn bản/file).
@@ -690,24 +756,13 @@ def load_documents(data_dir: str = "data_legalir") -> List[Dict]:
     """
     documents = []
 
-    possible_paths = [
-        data_dir,
-        "/kaggle/input/data_legalir",
-        "/kaggle/input/legalir-dataset",
-        "/kaggle/input/datasets/trngchnn/legalir-dataset/selected-contexts/selected-contexts",
-        "/content/selected-contexts",
-        "../data_legalir",
-    ]
-
-    found_path = None
-    for path in possible_paths:
-        if os.path.exists(path):
-            found_path = path
-            break
-
-    if found_path is None:
-        logger.warning(f" Không tìm thấy thư mục dữ liệu.")
+    if not os.path.exists(data_dir):
+        logger.warning(f" Không tìm thấy thư mục dữ liệu: {data_dir}")
+        logger.warning("   -> Sửa lại data_dir cho đúng path dataset bạn đã Add Data,")
+        logger.warning("      vd load_documents(data_dir=\"/kaggle/input/ten-dataset-cua-ban\")")
         return []
+
+    found_path = data_dir
 
     # Nếu path chứa 1 thư mục con duy nhất (VD giải nén zip ra subfolder),
     # và thư mục gốc không có sẵn .json, thì đi vào thư mục con đó.
