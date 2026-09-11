@@ -1,5 +1,5 @@
 """
-member_b.py - Knowledge Graph + BM25 + Hybrid Retrieval (Phiên bản hoàn chỉnh)
+member_b.py - Knowledge Graph + BM25 + Hybrid Retrieval (Phien ban hoan chinh)
 """
 
 import os
@@ -263,7 +263,6 @@ def hybrid_retrieve(query: str, top_k: int = 50) -> List[Dict]:
         doc_info = node_dict.get(chunk_id, {})
         doc_id = doc_info.get('doc_id', chunk_id.split('_')[0])
         
-        # Kiem tra trung lap doc_id
         existing_ids = [r['id'] for r in result]
         if doc_id not in existing_ids:
             result.append({
@@ -330,17 +329,27 @@ def get_graph_scores(query: str, top_k: int) -> Dict[str, float]:
             G = pickle.load(f)
         entities = extract_entities_advanced(query)
         for entity in entities:
-            entity_lower = entity.lower()
+            # SỬA: Đảm bảo entity là string
+            if isinstance(entity, dict):
+                entity_str = str(entity.get('value', ''))
+            else:
+                entity_str = str(entity)
+            entity_lower = entity_str.lower()
+            
+            if not entity_lower:
+                continue
+            
             for node_id in G.nodes():
-                node_text = str(G.nodes[node_id].get("text", "")).lower()
-                node_value = str(G.nodes[node_id].get("value", "")).lower()
+                node_data = G.nodes[node_id]
+                # SỬA: Xử lý an toàn khi text/value có thể là dict
+                node_text = str(node_data.get("text", "")).lower()
+                node_value = str(node_data.get("value", "")).lower()
+                
                 if entity_lower in node_text or entity_lower in node_value:
-                    if entity in node_text or entity in node_value:
-                        graph_scores[node_id] += 2.0
-                    else:
-                        graph_scores[node_id] += 1.0
+                    graph_scores[node_id] += 1.0
                     for neighbor in G.neighbors(node_id):
                         graph_scores[neighbor] += 0.5
+        
         sorted_scores = sorted(graph_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
         return dict(sorted_scores)
     except Exception as e:
@@ -401,12 +410,11 @@ def build_knowledge_graph_optimized(nodes: List[Dict], legal=None) -> nx.Graph:
                           relation=rel['type'],
                           weight=rel.get('weight', 1.0))
     
-    # Ket noi cac entity co cung tu khoa
     entity_nodes = [n for n in G.nodes() if G.nodes[n].get("type") == "entity"]
     for i in range(len(entity_nodes)):
         for j in range(i+1, len(entity_nodes)):
-            val1 = G.nodes[entity_nodes[i]].get('value', '')
-            val2 = G.nodes[entity_nodes[j]].get('value', '')
+            val1 = str(G.nodes[entity_nodes[i]].get('value', ''))
+            val2 = str(G.nodes[entity_nodes[j]].get('value', ''))
             common_words = set(val1.split()) & set(val2.split())
             if len(common_words) > 0:
                 G.add_edge(entity_nodes[i], entity_nodes[j], relation="co_occur", weight=0.5)

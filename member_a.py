@@ -1,5 +1,5 @@
 """
-member_a.py - RAPTOR + Vector Store (Phiên bản hoàn chỉnh)
+member_a.py - RAPTOR + Vector Store (Phien ban hoan chinh)
 """
 
 import os
@@ -230,13 +230,11 @@ def chunk_documents_optimized(documents: List[Dict]) -> List[Dict]:
                         }
                     })
         
-        # Checkpoint moi 50 chunk
         if len(chunks) % 50 == 0 and len(chunks) > 0:
             with open(CHUNK_CKPT, "wb") as f:
                 pickle.dump(chunks, f)
             logger.info(f"   Chunk checkpoint saved at {len(chunks)} chunks")
     
-    # Luu chunk checkpoint cuoi cung
     with open(CHUNK_CKPT, "wb") as f:
         pickle.dump(chunks, f)
     
@@ -301,7 +299,6 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
     
     tree = {"nodes": [], "levels": []}
     
-    # Level 0
     level_0 = chunks.copy()
     tree["nodes"].extend(level_0)
     tree["levels"].append({"level": 0, "node_ids": [n["id"] for n in level_0]})
@@ -311,7 +308,6 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
         pickle.dump(tree, f)
     logger.info("   Checkpoint saved (level 0)")
     
-    # Level 1
     if len(chunks) > 5:
         logger.info("   Building level 1 clusters...")
         try:
@@ -355,7 +351,6 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
                 pickle.dump(tree, f)
             logger.info("   Checkpoint saved (level 1)")
             
-            # Level 2
             if len(level_1) > 5:
                 logger.info("   Building level 2 clusters...")
                 level_1_texts = [n["text"] for n in level_1]
@@ -453,22 +448,44 @@ Tom tat:"""
 
 def load_documents(data_dir: str = "data_legalir") -> List[Dict]:
     documents = []
+    
     possible_paths = [
         data_dir,
+        "/kaggle/input/legalir-data",
         "/kaggle/input/legalir",
         "/kaggle/input/legalir-dataset",
+        "/kaggle/input/uit-dsc-task1",
+        "/kaggle/input/uit-dsc-2026-legalir",
         "../data_legalir",
+        "./data_legalir",
     ]
+    
     found_path = None
     for path in possible_paths:
         if os.path.exists(path):
-            found_path = path
-            break
+            json_files = [f for f in os.listdir(path) if f.endswith('.json')]
+            if json_files:
+                found_path = path
+                logger.info(f"Tim thay du lieu tai: {path}")
+                break
+    
+    if found_path is None and os.path.exists("/kaggle/input"):
+        for folder in os.listdir("/kaggle/input"):
+            full_path = os.path.join("/kaggle/input", folder)
+            if os.path.isdir(full_path):
+                json_files = [f for f in os.listdir(full_path) if f.endswith('.json')]
+                if json_files:
+                    found_path = full_path
+                    logger.info(f"Tim thay du lieu tai: {full_path}")
+                    break
+    
     if found_path is None:
         logger.warning("Khong tim thay thu muc du lieu.")
         return []
+    
     logger.info(f"Doc du lieu tu: {found_path}")
     json_files = [f for f in os.listdir(found_path) if f.endswith('.json')]
+    
     for filename in tqdm(json_files, desc="Loading files"):
         filepath = os.path.join(found_path, filename)
         try:
@@ -506,6 +523,7 @@ def load_documents(data_dir: str = "data_legalir") -> List[Dict]:
                             })
         except Exception as e:
             logger.warning(f"Loi doc {filename}: {e}")
+    
     logger.info(f"Loaded {len(documents)} documents")
     return documents
 
