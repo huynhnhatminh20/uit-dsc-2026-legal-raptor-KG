@@ -63,8 +63,37 @@ RELATION_CKPT = CKPT_DIR / "relations.pkl"
 # Checkpoint TẠM cho vòng lặp build graph (đặc biệt tốn thời gian khi có
 # LLM entity/relation extraction cho từng node) -> lưu định kỳ để resume,
 # tránh mất hết tiến trình nếu Kaggle ngắt giữa chừng.
+#
+# [SỬA LỖI HIỆU NĂNG] GRAPH_CKPT_INTERVAL=200 CỐ ĐỊNH là bug: mỗi lần lưu,
+# code pickle lại TOÀN BỘ graph G đã build từ đầu (không phải chỉ phần mới)
+# -> với hàng trăm nghìn node, cứ 200 node lại ghi lại full graph 1 lần =
+# I/O tăng theo kiểu O(n^2), y hệt bug encode_with_checkpoint ở member_a.py.
+# Giờ đổi interval SCALE THEO TỔNG SỐ NODE (xem _graph_ckpt_interval) thay
+# vì 1 số cố định nhỏ, để tổng số lần ghi full-graph không phụ thuộc n (chỉ
+# ghi khoảng ~15-20 lần dù n lớn hay nhỏ).
 GRAPH_PARTIAL_CKPT = CKPT_DIR / "graph_partial.pkl"
-GRAPH_CKPT_INTERVAL = 200  # lưu checkpoint tạm sau mỗi 200 nodes
+GRAPH_CKPT_INTERVAL_MIN = 500
+
+
+def _graph_ckpt_interval(total_nodes: int) -> int:
+    """Khoảng cách giữa 2 lần lưu checkpoint tạm khi build graph.
+
+    Luôn lưu tối thiểu GRAPH_CKPT_INTERVAL_MIN node/lần, nhưng nếu graph có
+    nhiều node thì giãn ra để tổng số lần ghi (mỗi lần ghi lại full graph)
+    không tăng theo n -> tránh I/O kiểu O(n^2).
+    """
+    return max(GRAPH_CKPT_INTERVAL_MIN, total_nodes // 20)
+
+
+# [SỬA LỖI] Nếu truyền `legal` (LLM) vào build_graph(), bản cũ sẽ gọi
+# legal.generate(...) CHO TỪNG NODE để trích entity/relation. Với vài trăm
+# nghìn node, gọi generate() (autoregressive, vài giây/lần) từng đó lần là
+# BẤT KHẢ THI (mất hàng chục/hàng trăm giờ), dù có checkpoint cũng không
+# cứu được vì bản chất là quá chậm chứ không phải do mất tiến trình. Giới
+# hạn: chỉ thật sự dùng LLM để trích entity/relation khi tổng số node đủ
+# nhỏ; ngược lại tự động dùng fallback bằng regex (nhanh, đã có sẵn) và log
+# cảnh báo rõ ràng thay vì âm thầm treo máy.
+LLM_ENTITY_EXTRACTION_MAX_NODES = 3000
 
 # ============ CONSTANTS ============
 RRF_K = 60
@@ -90,10 +119,26 @@ def _get_dense_embedder():
 
 
 def _get_graph_cached():
+    """Trả về dict {"graph": nx.Graph, "term_index": {term: [node_id,...]}}.
+
+    [SỬA] Trước đây GRAPH_CKPT chỉ lưu thẳng đối tượng nx.Graph. Giờ lưu kèm
+    `term_index` (inverted index term -> node_id) được build 1 LẦN DUY NHẤT
+    khi build_graph(), để get_graph_scores() ở dưới không phải quét toàn bộ
+    G.nodes() cho mỗi câu hỏi (xem giải thích chi tiết ở build_graph()).
+    """
     global _GRAPH_CACHE
     if _GRAPH_CACHE is None and GRAPH_CKPT.exists():
         with open(GRAPH_CKPT, "rb") as f:
-            _GRAPH_CACHE = pickle.load(f)
+            loaded = pickle.load(f)
+        if isinstance(loaded, dict) and "graph" in loaded:
+            _GRAPH_CACHE = loaded
+        else:
+            # Tương thích ngược nếu lỡ còn checkpoint kiểu cũ (chỉ có Graph
+            # trần, chưa có term_index) -> vẫn dùng được nhưng graph retrieval
+            # sẽ chậm hơn (fallback quét toàn bộ) cho tới khi build lại graph.
+            logger.warning(" GRAPH_CKPT ở định dạng cũ (không có term_index) -> "
+                            "nên xoá checkpoint và build_graph() lại để tăng tốc graph retrieval.")
+            _GRAPH_CACHE = {"graph": loaded, "term_index": {}}
     return _GRAPH_CACHE
 
 
@@ -121,7 +166,8 @@ def build_graph(legal=None):
     if GRAPH_CKPT.exists():
         logger.info(f" Load Graph từ checkpoint: {GRAPH_CKPT}")
         with open(GRAPH_CKPT, "rb") as f:
-            return pickle.load(f)
+            loaded = pickle.load(f)
+            return loaded["graph"] if isinstance(loaded, dict) and "graph" in loaded else loaded
     
     logger.info(" Đang xây dựng Knowledge Graph tối ưu...")
     
@@ -139,7 +185,21 @@ def build_graph(legal=None):
     
     logger.info(f" Có {len(nodes)} nodes từ RAPTOR")
 
-    
+    # [SỬA] Chỉ thật sự dùng LLM để trích entity/relation nếu số node đủ
+    # nhỏ để chạy generate() cho từng node trong thời gian hợp lý. Xem giải
+    # thích ở LLM_ENTITY_EXTRACTION_MAX_NODES phía trên.
+    effective_legal = legal
+    if legal is not None and len(nodes) > LLM_ENTITY_EXTRACTION_MAX_NODES:
+        logger.warning(
+            f" Có {len(nodes)} nodes > {LLM_ENTITY_EXTRACTION_MAX_NODES} -> "
+            f"BỎ QUA LLM khi trích entity/relation (gọi LLM.generate() cho "
+            f"từng node ở quy mô này sẽ mất hàng chục/hàng trăm giờ). Tự "
+            f"động dùng fallback bằng regex (extract_entities_advanced/"
+            f"extract_relations_from_text), vẫn nhanh và đủ dùng cho hầu "
+            f"hết trường hợp."
+        )
+        effective_legal = None
+
     # 3. Xây dựng Graph với LLM (resume từ checkpoint tạm nếu có, để không
     #    phải chạy lại từ node đầu tiên nếu bị ngắt giữa chừng)
     resume_state = None
@@ -148,11 +208,12 @@ def build_graph(legal=None):
         with open(GRAPH_PARTIAL_CKPT, "rb") as f:
             resume_state = pickle.load(f)
 
-    G = build_knowledge_graph_optimized(nodes, legal, resume_state=resume_state)
+    G, term_index = build_knowledge_graph_optimized(nodes, effective_legal, resume_state=resume_state)
     
-    # 4. Lưu checkpoint
+    # 4. Lưu checkpoint (kèm term_index để graph retrieval không phải quét
+    #    toàn bộ node mỗi câu hỏi - xem _get_graph_cached()/get_graph_scores())
     with open(GRAPH_CKPT, "wb") as f:
-        pickle.dump(G, f)
+        pickle.dump({"graph": G, "term_index": term_index}, f)
     logger.info(f" Graph checkpoint lưu tại {GRAPH_CKPT}")
 
     # Đã build xong graph hoàn chỉnh -> xóa checkpoint tạm, không cần nữa
@@ -160,6 +221,14 @@ def build_graph(legal=None):
         GRAPH_PARTIAL_CKPT.unlink()
     
     return G
+
+
+def get_graph():
+    """Trả về nx.Graph thuần (không kèm term_index), dùng cho code/test bên
+    ngoài chỉ cần duyệt graph. build_graph() ở trên vẫn là API chính, trả về
+    Graph để giữ tương thích ngược với chữ ký hàm cũ."""
+    data = _get_graph_cached()
+    return data["graph"] if data else None
 
 
 def build_bm25():
@@ -262,25 +331,33 @@ def hybrid_retrieve(query: str, top_k: int = 50) -> List[Dict]:
         "dense": 1.2,  # Dense retrieval có trọng số cao hơn
         "graph": 1.0
     }
-    
+
+    # [SỬA LỖI HIỆU NĂNG] Bản cũ gọi sorted(...).index(doc_id) BÊN TRONG
+    # vòng lặp "for doc_id in all_ids" -> với mỗi doc_id lại sort lại toàn
+    # bộ danh sách từ đầu (tốn O(m log m)) rồi mới .index() (tốn thêm O(m))
+    # để tìm hạng của riêng nó -> tổng cộng O(m^2 log m) cho toàn bộ vòng
+    # lặp thay vì chỉ cần O(m log m) nếu sort 1 lần. Giờ sort/đánh hạng 1
+    # LẦN DUY NHẤT cho mỗi phương pháp trước khi vào vòng lặp.
+    def _rank_dict(scores: Dict[str, float]) -> Dict[str, int]:
+        sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+        return {doc_id: rank + 1 for rank, doc_id in enumerate(sorted_ids)}
+
+    bm25_ranks = _rank_dict(bm25_scores)
+    dense_ranks = _rank_dict(dense_scores)
+    graph_ranks = _rank_dict(graph_scores)
+
     for doc_id in all_ids:
         score = 0
-        
-        # BM25 rank
-        if doc_id in bm25_scores:
-            rank = sorted(bm25_scores.keys(), key=lambda x: bm25_scores[x], reverse=True).index(doc_id) + 1
-            score += weights["bm25"] * 1 / (k + rank)
-        
-        # Dense rank
-        if doc_id in dense_scores:
-            rank = sorted(dense_scores.keys(), key=lambda x: dense_scores[x], reverse=True).index(doc_id) + 1
-            score += weights["dense"] * 1 / (k + rank)
-        
-        # Graph rank
-        if doc_id in graph_scores:
-            rank = sorted(graph_scores.keys(), key=lambda x: graph_scores[x], reverse=True).index(doc_id) + 1
-            score += weights["graph"] * 1 / (k + rank)
-        
+
+        if doc_id in bm25_ranks:
+            score += weights["bm25"] * 1 / (k + bm25_ranks[doc_id])
+
+        if doc_id in dense_ranks:
+            score += weights["dense"] * 1 / (k + dense_ranks[doc_id])
+
+        if doc_id in graph_ranks:
+            score += weights["graph"] * 1 / (k + graph_ranks[doc_id])
+
         rrf_scores[doc_id] = score
     
     # QUAN TRỌNG: các "doc_id" ở trên thực chất là ID của NODE (chunk hoặc
@@ -386,12 +463,24 @@ def get_dense_scores(query: str, vector_store, top_k: int) -> Dict[str, float]:
 
 
 def get_graph_scores(query: str, top_k: int) -> Dict[str, float]:
-    """Lấy graph retrieval scores với multi-hop"""
+    """Lấy graph retrieval scores với multi-hop.
+
+    [SỬA LỖI HIỆU NĂNG] Bản cũ duyệt `for node_id in G.nodes()` (TOÀN BỘ
+    node trong graph) cho MỖI entity trích được từ câu hỏi -> với graph có
+    hàng trăm nghìn node, một câu hỏi vài entity đã tốn hàng trăm nghìn *
+    vài phép so sánh chuỗi, nhân với hàng trăm câu hỏi trong file inference
+    thì cực chậm. Giờ dùng `term_index` (inverted index, build sẵn 1 lần khi
+    build_graph()) để tra thẳng ra danh sách node ứng viên theo từng token,
+    không cần quét toàn graph.
+    """
     graph_scores = defaultdict(float)
     
-    G = _get_graph_cached()
-    if G is None:
+    graph_data = _get_graph_cached()
+    if graph_data is None:
         return dict(graph_scores)
+
+    G = graph_data["graph"]
+    term_index = graph_data.get("term_index", {})
     
     try:
         # Trích xuất entities từ query
@@ -402,22 +491,34 @@ def get_graph_scores(query: str, top_k: int) -> Dict[str, float]:
             # {'type': ..., 'value': ..., 'metadata': ...}
             entity_value = str(entity.get("value", ""))
             entity_lower = entity_value.lower()
-    
+
             if not entity_lower:
                 continue
-    
-            # Tìm nodes chứa entity
-            for node_id in G.nodes():
+
+            # Tra cứu qua term_index thay vì quét toàn bộ G.nodes(). Nếu
+            # term_index rỗng (checkpoint cũ chưa có, xem _get_graph_cached)
+            # thì fallback về quét toàn bộ như bản cũ để không mất kết quả.
+            terms = tokenize_document_advanced(entity_value)
+            if term_index:
+                candidate_ids = set()
+                for t in terms:
+                    candidate_ids.update(term_index.get(t, ()))
+            else:
+                candidate_ids = G.nodes()
+
+            for node_id in candidate_ids:
+                if node_id not in G:
+                    continue
                 node_text = str(G.nodes[node_id].get("text", "")).lower()
                 node_value = str(G.nodes[node_id].get("value", "")).lower()
-        
+
                 if entity_lower in node_text or entity_lower in node_value:
                     # Score cao hơn nếu match chính xác
                     if entity_lower == node_value:
                         graph_scores[node_id] += 2.0
                     else:
                         graph_scores[node_id] += 1.0
-            
+
                     # Multi-hop: thêm score cho neighbors
                     for neighbor in G.neighbors(node_id):
                         graph_scores[neighbor] += 0.5
@@ -442,30 +543,55 @@ def get_graph_scores(query: str, top_k: int) -> Dict[str, float]:
 
 # ============ TỐI ƯU KNOWLEDGE GRAPH ============
 
-def build_knowledge_graph_optimized(nodes: List[Dict], legal=None, resume_state: Optional[Dict] = None) -> nx.Graph:
+def _index_text(term_index: Dict[str, set], text: str, node_id: str):
+    """Thêm node_id vào term_index cho mỗi token trong text (dùng chung
+    tokenizer với BM25 để nhất quán). Đây là bước xây INVERTED INDEX 1 LẦN
+    DUY NHẤT lúc build graph, để get_graph_scores() sau này tra cứu O(1) mỗi
+    token thay vì phải quét qua TOÀN BỘ node trong graph cho mỗi câu hỏi
+    (bug hiệu năng nghiêm trọng nhất của bản cũ ở quy mô lớn: n node lớn ->
+    mỗi câu hỏi chậm tuyến tính theo n, hàng trăm câu hỏi thì nhân lên nữa).
     """
-    Xây dựng Knowledge Graph từ nodes với LLM entity extraction
+    for token in tokenize_document_advanced(text):
+        term_index.setdefault(token, set()).add(node_id)
+
+
+def build_knowledge_graph_optimized(
+    nodes: List[Dict], legal=None, resume_state: Optional[Dict] = None
+) -> Tuple[nx.Graph, Dict[str, List[str]]]:
+    """
+    Xây dựng Knowledge Graph từ nodes với LLM entity extraction (nếu có).
 
     Args:
         nodes: Danh sách RAPTOR nodes
-        legal: Legal LLM (optional)
-        resume_state: Nếu có (dict {"graph", "all_entities", "all_relations",
-            "processed_count"}), sẽ resume từ node thứ processed_count thay
-            vì xây lại từ đầu. Dùng khi lần chạy trước bị ngắt giữa chừng.
+        legal: Legal LLM (optional) - LƯU Ý: nơi gọi (build_graph()) đã tự
+            động tắt LLM nếu số node quá lớn, xem LLM_ENTITY_EXTRACTION_MAX_NODES.
+        resume_state: Nếu có (dict {"graph", "term_index", "all_entities",
+            "all_relations", "processed_count"}), sẽ resume từ node thứ
+            processed_count thay vì xây lại từ đầu.
+
+    Returns:
+        (G, term_index): term_index là {token: [node_id, ...]} dùng cho
+        graph retrieval nhanh (xem get_graph_scores()).
     """
     if resume_state is not None:
         G = resume_state["graph"]
         all_entities = resume_state["all_entities"]
         all_relations = resume_state["all_relations"]
         start_idx = resume_state["processed_count"]
+        # term_index có thể chưa có trong checkpoint cũ hơn -> tạo mới nếu thiếu.
+        term_index = resume_state.get("term_index") or {}
+        term_index = {k: set(v) for k, v in term_index.items()}
         logger.info(f" Resume xây Knowledge Graph từ node {start_idx}/{len(nodes)}...")
     else:
         logger.info(" Building Knowledge Graph tối ưu...")
         G = nx.Graph()
         all_entities = []
         all_relations = []
+        term_index: Dict[str, set] = {}
         start_idx = 0
-    
+
+    ckpt_interval = _graph_ckpt_interval(len(nodes))
+
     # Thêm các document nodes
     for idx in tqdm(range(start_idx, len(nodes)), desc="Adding nodes",
                      initial=start_idx, total=len(nodes)):
@@ -479,8 +605,11 @@ def build_knowledge_graph_optimized(nodes: List[Dict], legal=None, resume_state:
                    text=text[:500],
                    level=level,
                    metadata=node.get("metadata", {}))
+        _index_text(term_index, text, node_id)
         
-        # Trích xuất entities bằng LLM nếu có
+        # Trích xuất entities bằng LLM nếu có (nơi gọi build_graph() đã tự
+        # tắt legal khi số node quá lớn, nên nhánh legal is not None ở đây
+        # chỉ chạy khi thật sự khả thi về thời gian)
         if legal is not None:
             entities = extract_entities_with_llm(text, legal)
             relations = extract_relations_with_llm(text, legal)
@@ -500,20 +629,23 @@ def build_knowledge_graph_optimized(nodes: List[Dict], legal=None, resume_state:
                           entity_type=entity['type'],
                           value=entity['value'],
                           metadata=entity.get('metadata', {}))
+                _index_text(term_index, entity['value'], entity_id)
             G.add_edge(node_id, entity_id, relation="contains", weight=1.0)
 
-        # Lưu checkpoint TẠM định kỳ. Đây là vòng lặp tốn thời gian nhất
-        # (đặc biệt khi có LLM generate cho từng node) và dễ bị Kaggle ngắt
-        # giữa chừng nhất -> nếu không có checkpoint tạm, mất là mất sạch.
-        if (idx + 1) % GRAPH_CKPT_INTERVAL == 0:
+        # Lưu checkpoint TẠM định kỳ. Đây là vòng lặp tốn thời gian nhất và
+        # dễ bị Kaggle ngắt giữa chừng nhất -> nếu không có checkpoint tạm,
+        # mất là mất sạch. `ckpt_interval` GIÃN THEO tổng số node (thay vì
+        # cố định 200) để tổng số lần ghi lại full-graph không phụ thuộc n.
+        if (idx + 1) % ckpt_interval == 0:
             with open(GRAPH_PARTIAL_CKPT, "wb") as f:
                 pickle.dump({
                     "graph": G,
                     "all_entities": all_entities,
                     "all_relations": all_relations,
+                    "term_index": {k: list(v) for k, v in term_index.items()},
                     "processed_count": idx + 1,
                 }, f)
-            logger.info(f"    Checkpoint tạm Graph tại node {idx + 1}/{len(nodes)}")
+            logger.info(f"    Checkpoint tạm Graph tại node {idx + 1}/{len(nodes)} (interval={ckpt_interval})")
     
     # Thêm relation edges
     for rel in all_relations:
@@ -532,8 +664,10 @@ def build_knowledge_graph_optimized(nodes: List[Dict], legal=None, resume_state:
     # Kết nối các entity liên quan dựa trên đồng xuất hiện
     connect_related_entities(G, nodes)
     
-    logger.info(f" Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-    return G
+    logger.info(f" Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges, "
+                f"term_index: {len(term_index)} terms")
+    term_index_out = {k: list(v) for k, v in term_index.items()}
+    return G, term_index_out
 
 
 def extract_entities_with_llm(text: str, legal_llm) -> List[Dict]:

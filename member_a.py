@@ -69,61 +69,92 @@ CHUNK_CKPT = CKPT_DIR / "chunks.pkl"
 # Checkpoint riêng cho bước encode (GPU, tốn thời gian nhất, dễ bị Kaggle
 # ngắt giữa chừng nhất) -> lưu theo batch để có thể resume, không phải
 # encode lại từ đầu nếu mất kết nối/hết giờ giữa chừng.
-EMBED_CKPT_CHUNKS = CKPT_DIR / "embed_chunks.pkl"
-EMBED_CKPT_NODES = CKPT_DIR / "embed_nodes.pkl"
+#
+# [SỬA LỖI HIỆU NĂNG] Trước đây đây là 1 FILE .pkl duy nhất, và MỖI BATCH
+# đều ghi đè lại TOÀN BỘ list embeddings đã encode từ đầu tới giờ. Với
+# ~800k chunk, batch cuối phải ghi lại full ~800k vector MỖI LẦN -> tổng
+# I/O tăng theo kiểu O(n^2), khiến encode càng về sau càng chậm dần (đây
+# chính là nguyên nhân log train bị "đứng hình" ở bước Encoding chunks).
+# Giờ đổi thành 1 THƯ MỤC chứa nhiều "shard" (mỗi batch = 1 file .npy
+# riêng) -> mỗi batch chỉ ghi đúng phần MỚI của batch đó, tổng chi phí ghi
+# đĩa là O(n), không tăng dần theo tiến trình. Resume chỉ cần đếm số shard
+# đã có, không cần đọc lại nội dung cũ.
+EMBED_CKPT_CHUNKS = CKPT_DIR / "embed_shards_chunks"
+EMBED_CKPT_NODES = CKPT_DIR / "embed_shards_nodes"
+# [SỬA LỖI HIỆU NĂNG - MỚI PHÁT HIỆN] build_vector_store() gọi
+# encode_with_checkpoint() cho TẤT CẢ node của tree (bao gồm toàn bộ node
+# level 0, tức chính là các chunk vừa được encode xong trong build_raptor()
+# vài dòng phía trên) -> ENCODE LẠI TỪ ĐẦU đúng những gì đã encode, tốn
+# gấp đôi thời gian GPU cho bước nặng nhất của cả pipeline (y hệt cảm giác
+# "đứng ở bước encode" lần thứ 2, chỉ là ở build_vector_store thay vì
+# build_raptor). Giờ lưu lại embeddings level 0 đã tính (theo id) vào 1
+# file cache gọn, để build_vector_store() TÁI SỬ DỤNG thay vì encode lại;
+# chỉ còn phải encode mới cho node level 1/2 (cluster summary, số lượng
+# rất nhỏ, tối đa N_CLUSTERS_CAP_L1 + N_CLUSTERS_CAP_L2 ~ 65 node).
+LEVEL0_EMBED_CACHE = CKPT_DIR / "level0_embeddings.npz"
 
 # ============ CONSTANTS ============
 CHUNK_SIZE = 512
 OVERLAP = 50
 EMBEDDING_MODEL = "BAAI/bge-m3"
 CLUSTER_THRESHOLD = 0.7
+# Có tối đa bao nhiêu LLM call khi tóm tắt cluster ở RAPTOR level 1/2. Số
+# cluster luôn nhỏ (xem N_CLUSTERS_CAP) nên không cần giới hạn thêm, nhưng
+# để tường minh ở 1 chỗ.
+N_CLUSTERS_CAP_L1 = 50
+N_CLUSTERS_CAP_L2 = 15
 
 
-# ============ ENCODE CÓ CHECKPOINT ============
+# ============ ENCODE CÓ CHECKPOINT (SHARD, O(n) KHÔNG PHẢI O(n^2)) ============
 
-def encode_with_checkpoint(embedder, texts: List[str], ckpt_path: pathlib.Path,
+def encode_with_checkpoint(embedder, texts: List[str], shard_dir: pathlib.Path,
                             batch_size: int = 256, desc: str = "Encoding") -> np.ndarray:
     """
-    Encode văn bản theo từng batch và LƯU CHECKPOINT SAU MỖI BATCH.
+    Encode văn bản theo từng batch, MỖI BATCH LƯU RA 1 FILE SHARD (.npy)
+    RIÊNG trong `shard_dir`, thay vì ghi đè lại toàn bộ danh sách embeddings
+    mỗi lần (cách cũ gây I/O O(n^2), xem giải thích ở chỗ khai báo
+    EMBED_CKPT_CHUNKS/NODES phía trên).
 
-    Đây là bước tốn thời gian nhất (chạy GPU trên hàng trăm nghìn chunks) và
-    cũng là bước dễ bị Kaggle ngắt session giữa chừng nhất. Trước đây bước
-    này chỉ chạy embedder.encode(texts) một lần duy nhất, kết quả nằm hoàn
-    toàn trong RAM -> nếu bị ngắt giữa chừng thì MẤT TRẮNG toàn bộ embeddings
-    đã tính, phải encode lại từ đầu.
+    Mỗi batch chỉ ghi đúng phần embeddings MỚI của batch đó -> tổng chi phí
+    ghi đĩa tỉ lệ thuận O(n), không tăng dần theo tiến trình như trước.
 
-    Hàm này thay thế bằng cách encode từng batch nhỏ, lưu checkpoint (kèm vị
-    trí đã encode tới đâu) sau mỗi batch. Nếu session bị ngắt và chạy lại,
-    sẽ tự động resume từ đúng batch còn dang dở thay vì bắt đầu lại từ 0.
+    Resume: chỉ cần đếm số shard file `part_*.npy` đã có trong `shard_dir`
+    (mỗi shard ứng đúng 1 batch, theo đúng thứ tự) để biết đã encode tới
+    batch nào, không cần đọc lại nội dung cũ.
+
+    Ghi an toàn: encode xong 1 batch mới ghi ra file `.tmp` rồi rename sang
+    tên thật -> nếu bị ngắt đúng lúc đang ghi thì shard đó coi như chưa
+    hoàn thành (không để lại file part_*.npy hỏng làm sai số đếm resume).
     """
-    if ckpt_path.exists():
-        with open(ckpt_path, "rb") as f:
-            state = pickle.load(f)
-        done_embeddings = state["embeddings"]
-        start_idx = state["done_count"]
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    n = len(texts)
+    n_batches = (n + batch_size - 1) // batch_size
 
-        if start_idx >= len(texts):
-            logger.info(f" Đã encode đủ {len(texts)} văn bản, load checkpoint: {ckpt_path}")
-            return np.array(done_embeddings)
+    existing_shards = sorted(shard_dir.glob("part_*.npy"))
+    start_batch = 0
+    while (shard_dir / f"part_{start_batch:06d}.npy").exists():
+        start_batch += 1
 
-        logger.info(f" Resume encoding từ vị trí {start_idx}/{len(texts)} (checkpoint: {ckpt_path})")
-    else:
-        done_embeddings = []
-        start_idx = 0
+    if start_batch >= n_batches:
+        logger.info(f" Đã encode đủ {n} văn bản, load {start_batch} shard checkpoint: {shard_dir}")
+    elif start_batch > 0:
+        logger.info(f" Resume encoding từ batch {start_batch}/{n_batches} (shard checkpoint: {shard_dir})")
 
-    for i in tqdm(range(start_idx, len(texts), batch_size), desc=desc):
+    for b in tqdm(range(start_batch, n_batches), desc=desc, initial=start_batch, total=n_batches):
+        i = b * batch_size
         batch = texts[i:i + batch_size]
-        batch_emb = embedder.encode(batch)
-        done_embeddings.extend(list(batch_emb))
+        batch_emb = np.asarray(embedder.encode(batch))
 
-        # Lưu checkpoint ngay sau mỗi batch, không đợi encode xong hết
-        with open(ckpt_path, "wb") as f:
-            pickle.dump({
-                "embeddings": done_embeddings,
-                "done_count": i + len(batch),
-            }, f)
+        shard_path = shard_dir / f"part_{b:06d}.npy"
+        tmp_path = shard_dir / f"part_{b:06d}.tmp.npy"
+        np.save(tmp_path, batch_emb)
+        tmp_path.rename(shard_path)
 
-    return np.array(done_embeddings)
+    # Gộp toàn bộ shard lại thành 1 mảng duy nhất để trả về (chỉ ĐỌC, các
+    # lần chạy sau không phải ghi lại phần đã có).
+    shards = sorted(shard_dir.glob("part_*.npy"))
+    embeddings = np.concatenate([np.load(s) for s in shards], axis=0)
+    return embeddings
 
 
 # ============ HÀM CHÍNH ============
@@ -180,6 +211,19 @@ def build_raptor(legal=None, emb=None):
     logger.info("   Encoding chunks...")
     embeddings = encode_with_checkpoint(embedder, texts, EMBED_CKPT_CHUNKS, desc="Encoding chunks")
 
+    # Lưu cache embeddings level-0 theo id để build_vector_store() TÁI SỬ
+    # DỤNG sau này thay vì encode lại toàn bộ chunk lần nữa (xem giải thích
+    # ở khai báo LEVEL0_EMBED_CACHE phía trên).
+    try:
+        np.savez(
+            str(LEVEL0_EMBED_CACHE),
+            ids=np.array([c["id"] for c in chunks], dtype=object),
+            vectors=embeddings.astype("float32"),
+        )
+        logger.info(f"   Đã lưu cache embedding level-0 ({len(chunks)} vectors) -> {LEVEL0_EMBED_CACHE}")
+    except Exception as e:
+        logger.warning(f" Không lưu được cache embedding level-0: {e}")
+
     # 6. Xây dựng cây RAPTOR (phiên bản tối ưu)
     tree = build_raptor_tree_optimized(chunks, embeddings, embedder, legal)
 
@@ -191,7 +235,7 @@ def build_raptor(legal=None, emb=None):
     # Đã build xong tree -> không cần checkpoint embedding trung gian nữa,
     # xóa để tránh chiếm dung lượng ổ đĩa Kaggle không cần thiết.
     if EMBED_CKPT_CHUNKS.exists():
-        EMBED_CKPT_CHUNKS.unlink()
+        shutil.rmtree(EMBED_CKPT_CHUNKS)
 
     return tree
 
@@ -244,10 +288,43 @@ def build_vector_store(emb=None):
         node_ids.append(node["id"])
         metadata_list.append(node.get("metadata", {}))
     
-    # 5. Tạo embeddings (có checkpoint theo batch, resume được nếu bị ngắt
-    #    giữa chừng thay vì encode lại từ đầu)
-    logger.info(f"   Encoding {len(texts)} nodes...")
-    embeddings = encode_with_checkpoint(embedder, texts, EMBED_CKPT_NODES, desc="Encoding nodes")
+    # 5. Tạo embeddings - TÁI SỬ DỤNG embeddings level-0 đã encode sẵn từ
+    #    build_raptor() (xem LEVEL0_EMBED_CACHE), CHỈ encode mới cho node
+    #    chưa có trong cache (thực chất là node level 1/2 - cluster summary,
+    #    số lượng rất nhỏ). [SỬA LỖI HIỆU NĂNG] Trước đây hàm này luôn gọi
+    #    encode_with_checkpoint() cho TẤT CẢ node kể cả node level 0, tức
+    #    encode lại lần 2 chính các chunk vừa encode xong ở build_raptor(),
+    #    tốn gấp đôi thời gian GPU cho bước nặng nhất pipeline.
+    cached_vectors: Dict[str, np.ndarray] = {}
+    if LEVEL0_EMBED_CACHE.exists():
+        try:
+            cache_data = np.load(str(LEVEL0_EMBED_CACHE), allow_pickle=True)
+            cached_vectors = dict(zip(cache_data["ids"].tolist(), cache_data["vectors"]))
+            logger.info(f"   Tái sử dụng {len(cached_vectors)} embedding level-0 đã tính sẵn (không encode lại)")
+        except Exception as e:
+            logger.warning(f" Không đọc được cache embedding level-0, sẽ encode lại toàn bộ: {e}")
+
+    missing_indices = [i for i, nid in enumerate(node_ids) if nid not in cached_vectors]
+
+    if missing_indices:
+        missing_texts = [texts[i] for i in missing_indices]
+        logger.info(f"   Encoding {len(missing_texts)}/{len(texts)} nodes chưa có cache "
+                    f"(cluster level 1/2, hoặc cache không khớp)...")
+        # Số lượng còn lại thường rất nhỏ (vài chục node cluster) nên
+        # không cần checkpoint theo shard như encode_with_checkpoint,
+        # encode thẳng 1 lần cho gọn.
+        missing_embeddings = np.asarray(embedder.encode(missing_texts, batch_size=64, show_progress_bar=True))
+    else:
+        missing_embeddings = None
+
+    dim = (next(iter(cached_vectors.values())).shape[0] if cached_vectors
+           else missing_embeddings.shape[1])
+    embeddings = np.zeros((len(node_ids), dim), dtype="float32")
+    for i, nid in enumerate(node_ids):
+        if nid in cached_vectors:
+            embeddings[i] = cached_vectors[nid]
+    for j, i in enumerate(missing_indices):
+        embeddings[i] = missing_embeddings[j]
     
     # 6. Tạo FAISS index (IVF cho tốc độ)
     dim = embeddings.shape[1]
@@ -280,7 +357,7 @@ def build_vector_store(emb=None):
 
     # Đã build xong vector store -> xóa checkpoint embedding trung gian
     if EMBED_CKPT_NODES.exists():
-        EMBED_CKPT_NODES.unlink()
+        shutil.rmtree(EMBED_CKPT_NODES)
 
     return vector_store
 
@@ -293,6 +370,19 @@ def chunk_documents_optimized(documents: List[Dict]) -> List[Dict]:
     - Giữ nguyên cấu trúc Điều - Khoản - Điểm
     - Thêm metadata (tên văn bản, chương, loại văn bản)
     - Bảo toàn ngữ cảnh
+
+    [SỬA LỖI HIỆU NĂNG] Bản trước LUÔN tách xuống tận cấp Điểm (a, b, c...)
+    bất kể Khoản dài hay ngắn -> với dữ liệu thật (~8.5k văn bản) tạo ra
+    ~811k chunk (mỗi Khoản 3-4 điểm lại thành 3-4 chunk riêng, phần lớn chỉ
+    vài chục ký tự). Số chunk khổng lồ này kéo chậm MỌI bước phía sau: encode
+    embedding, RAPTOR clustering, build Knowledge Graph, BM25...
+
+    Giờ đổi chiến lược: MỘT KHOẢN GIỮ NGUYÊN LÀ 1 CHUNK (gồm cả các điểm bên
+    trong) nếu đủ ngắn (<= CHUNK_SIZE ký tự). CHỈ tách tiếp xuống cấp Điểm khi
+    Khoản đó dài hơn CHUNK_SIZE (thật sự cần chia nhỏ để không mất ngữ cảnh
+    khi encode/rerank). Việc này giảm số chunk xuống nhiều lần (còn tuỳ dữ
+    liệu, thường 5-10 lần) mà không mất thông tin, vì đa số Khoản trong văn
+    bản pháp luật vốn đã ngắn hơn 512 ký tự.
     """
     chunks = []
     
@@ -320,10 +410,34 @@ def chunk_documents_optimized(documents: List[Dict]) -> List[Dict]:
                     for clause in clauses:
                         clause_num = clause['num']
                         clause_text = clause['text']
-                        
-                        # 3. Tách theo Điểm
+                        clause_stripped = clause_text.strip()
+
+                        if not clause_stripped or len(clause_stripped) <= 20:
+                            continue
+
+                        if len(clause_stripped) <= CHUNK_SIZE:
+                            # Khoản đã đủ ngắn -> giữ nguyên cả khoản (kể cả
+                            # các điểm bên trong) làm 1 chunk duy nhất, KHÔNG
+                            # tách vụn xuống cấp điểm.
+                            chunks.append({
+                                'id': f"{doc_id}_a{article_num}_c{clause_num}",
+                                'text': f"[{title}] Điều {article_num}, Khoản {clause_num}: {clause_stripped[:CHUNK_SIZE]}",
+                                'level': 0,
+                                'metadata': {
+                                    'doc_id': doc_id,
+                                    'title': title,
+                                    'doc_type': doc_type,
+                                    'article': article_num,
+                                    'clause': clause_num,
+                                    'source': 'legal_document'
+                                }
+                            })
+                            continue
+
+                        # 3. Khoản quá dài -> mới cần tách theo Điểm để
+                        # không cắt cụt mất thông tin.
                         points = split_by_point(clause_text)
-                        
+
                         if points:
                             for point in points:
                                 if len(point['text'].strip()) > 20:
@@ -342,21 +456,28 @@ def chunk_documents_optimized(documents: List[Dict]) -> List[Dict]:
                                         }
                                     })
                         else:
-                            # Không có Điểm, chunk theo Khoản
-                            if len(clause_text.strip()) > 20:
-                                chunks.append({
-                                    'id': f"{doc_id}_a{article_num}_c{clause_num}",
-                                    'text': f"[{title}] Điều {article_num}, Khoản {clause_num}: {clause_text[:CHUNK_SIZE]}",
-                                    'level': 0,
-                                    'metadata': {
-                                        'doc_id': doc_id,
-                                        'title': title,
-                                        'doc_type': doc_type,
-                                        'article': article_num,
-                                        'clause': clause_num,
-                                        'source': 'legal_document'
-                                    }
-                                })
+                            # Khoản dài nhưng không tách được theo Điểm ->
+                            # cắt cứng thành nhiều đoạn CHUNK_SIZE ký tự (có
+                            # overlap) để không mất phần đuôi văn bản.
+                            step = max(CHUNK_SIZE - OVERLAP, 1)
+                            for seg_idx, start in enumerate(range(0, len(clause_stripped), step)):
+                                segment = clause_stripped[start:start + CHUNK_SIZE]
+                                if len(segment.strip()) > 20:
+                                    chunks.append({
+                                        'id': f"{doc_id}_a{article_num}_c{clause_num}_s{seg_idx}",
+                                        'text': f"[{title}] Điều {article_num}, Khoản {clause_num}: {segment}",
+                                        'level': 0,
+                                        'metadata': {
+                                            'doc_id': doc_id,
+                                            'title': title,
+                                            'doc_type': doc_type,
+                                            'article': article_num,
+                                            'clause': clause_num,
+                                            'source': 'legal_document'
+                                        }
+                                    })
+                                if start + CHUNK_SIZE >= len(clause_stripped):
+                                    break
                 else:
                     # Không có Khoản, chunk theo Điều
                     if len(article_text.strip()) > 20:
@@ -543,10 +664,16 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
             from sklearn.cluster import MiniBatchKMeans
 
             # LƯU Ý: AgglomerativeClustering cần ma trận khoảng cách O(n^2) -
-            # với ~387k chunks (kho 8.5k văn bản thật) sẽ cần hàng trăm GB RAM
-            # và chắc chắn crash/treo trên Kaggle. Dùng MiniBatchKMeans thay
-            # thế vì nó chỉ cần O(n) bộ nhớ và scale tốt tới hàng triệu điểm.
-            n_clusters = min(max(3, len(chunks) // 4), 15)
+            # với hàng trăm nghìn chunk sẽ cần hàng trăm GB RAM và chắc chắn
+            # crash/treo trên Kaggle. Dùng MiniBatchKMeans thay thế vì nó chỉ
+            # cần O(n) bộ nhớ và scale tốt tới hàng triệu điểm.
+            #
+            # Số cluster: dùng heuristic sqrt(n) (phổ biến cho KMeans) thay vì
+            # công thức cũ "//4 rồi cap 15" (cap 15 quá ít so với hàng trăm
+            # nghìn chunk -> mỗi cluster chứa hàng chục nghìn chunk, tóm tắt
+            # rất thô). Vẫn cap ở N_CLUSTERS_CAP_L1 để không tạo quá nhiều
+            # cluster (mỗi cluster tốn 1 lần gọi LLM/summarize).
+            n_clusters = min(max(3, int(len(chunks) ** 0.5)), N_CLUSTERS_CAP_L1)
 
             # Chuẩn hoá vector về độ dài 1 để KMeans (dùng khoảng cách Euclid)
             # xấp xỉ đúng hành vi của cosine similarity.
@@ -568,12 +695,20 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
                 cluster_indices = [i for i, label in enumerate(labels) if label == cluster_idx]
                 cluster_chunks = [chunks[i] for i in cluster_indices]
                 cluster_texts = [c["text"] for c in cluster_chunks]
+                # TÁI SỬ DỤNG embeddings đã encode sẵn ở bước trước (tham số
+                # `embeddings` truyền vào hàm), KHÔNG gọi embedder.encode()
+                # lại lần nữa cho từng cluster. [SỬA LỖI HIỆU NĂNG] bản cũ
+                # gọi embedder.encode(cluster_texts) bên trong
+                # summarize_cluster_advanced() cho MỖI cluster -> tổng cộng
+                # encode lại gần như TOÀN BỘ chunk một lần nữa, tốn thêm
+                # ngang bằng cả bước encode ban đầu một cách vô ích.
+                cluster_embeddings = embeddings[cluster_indices]
 
                 if len(cluster_texts) > 1:
-                    if legal_llm is not None:
+                    if legal_llm is not None and getattr(legal_llm, "model", None) is not None:
                         summary = summarize_cluster_with_llm(cluster_texts, legal_llm)
                     else:
-                        summary = summarize_cluster_advanced(cluster_texts, embedder)
+                        summary = summarize_cluster_advanced(cluster_texts, cluster_embeddings)
 
                     level_1.append({
                         "id": f"cluster_{cluster_idx}",
@@ -611,10 +746,13 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
         try:
             from sklearn.cluster import MiniBatchKMeans
 
+            # level_1 chỉ có tối đa N_CLUSTERS_CAP_L1 phần tử (là các bản tóm
+            # tắt cluster, không phải toàn bộ chunk) nên encode lại ở đây rẻ,
+            # không phải vấn đề hiệu năng như ở level 1.
             level_1_texts = [n["text"] for n in level_1]
             level_1_embeddings = embedder.encode(level_1_texts)
 
-            n_clusters_2 = min(max(2, len(level_1) // 3), 10)
+            n_clusters_2 = min(max(2, len(level_1) // 3), N_CLUSTERS_CAP_L2)
             l1_f32 = level_1_embeddings.astype('float32')
             l1_norms = np.linalg.norm(l1_f32, axis=1, keepdims=True)
             l1_norms[l1_norms == 0] = 1.0
@@ -632,12 +770,13 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
                 cluster_indices = [i for i, label in enumerate(labels_2) if label == cluster_idx]
                 cluster_nodes = [level_1[i] for i in cluster_indices]
                 cluster_texts = [n["text"] for n in cluster_nodes]
+                cluster_embeddings_2 = level_1_embeddings[cluster_indices]
 
                 if len(cluster_texts) > 1:
-                    if legal_llm is not None:
+                    if legal_llm is not None and getattr(legal_llm, "model", None) is not None:
                         summary = summarize_cluster_with_llm(cluster_texts, legal_llm)
                     else:
-                        summary = summarize_cluster_advanced(cluster_texts, embedder)
+                        summary = summarize_cluster_advanced(cluster_texts, cluster_embeddings_2)
 
                     level_2.append({
                         "id": f"cluster_level2_{cluster_idx}",
@@ -667,9 +806,14 @@ def build_raptor_tree_optimized(chunks: List[Dict], embeddings: np.ndarray, embe
     return tree
 
 
-def summarize_cluster_advanced(texts: List[str], embedder) -> str:
+def summarize_cluster_advanced(texts: List[str], embeddings: np.ndarray) -> str:
     """
-    Tóm tắt cluster bằng cách lấy các đoạn đại diện
+    Tóm tắt cluster bằng cách lấy các đoạn đại diện (gần tâm cluster nhất).
+
+    [SỬA LỖI HIỆU NĂNG] Tham số thứ 2 trước đây là `embedder` (model) và hàm
+    tự gọi `embedder.encode(texts)` lại từ đầu cho mỗi cluster. Giờ nhận
+    thẳng `embeddings` (mảng numpy) đã tính sẵn từ bước encode chunk ban đầu
+    (được truyền vào qua cluster_indices ở nơi gọi) -> không encode lại.
     """
     if not texts:
         return ""
@@ -678,7 +822,6 @@ def summarize_cluster_advanced(texts: List[str], embedder) -> str:
         return texts[0]
     
     try:
-        embeddings = embedder.encode(texts)
         mean_emb = np.mean(embeddings, axis=0)
         distances = np.linalg.norm(embeddings - mean_emb, axis=1)
         

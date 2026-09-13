@@ -59,8 +59,29 @@ EVAL_CKPT = CKPT_DIR / "eval_fn.pkl"
 # Checkpoint TẠM cho vòng lặp tạo submission (retrieve + rerank từng query
 # có thể rất chậm nếu có hàng trăm/nghìn câu hỏi) -> lưu định kỳ để resume,
 # không phải chạy lại từ query đầu tiên nếu bị ngắt giữa chừng.
+#
+# [SỬA LỖI HIỆU NĂNG] Cùng họ bug với encode_with_checkpoint (member_a.py)
+# và GRAPH_CKPT_INTERVAL (member_b.py): interval CỐ ĐỊNH (20) nghĩa là mỗi
+# lần lưu, ta pickle lại TOÀN BỘ dict `submission` đã tích luỹ từ đầu, chứ
+# không phải chỉ phần mới -> số lần ghi tỉ lệ n/20 và mỗi lần ghi có size
+# tỉ lệ với số query đã xử lý => tổng I/O tăng kiểu O(n^2) nếu n (số câu
+# hỏi) lớn. Với vài trăm/nghìn câu hỏi và mỗi entry chỉ ≤5 doc id thì ảnh
+# hưởng không nghiêm trọng như embedding (member_a) hay graph (member_b),
+# nhưng vẫn nên sửa để nhất quán và an toàn nếu tập câu hỏi lớn hơn dự kiến.
+# Giải pháp: giãn interval theo tổng số query (giống _graph_ckpt_interval ở
+# member_b) để tổng số lần ghi full-dict không tăng theo n.
 SUBMISSION_CKPT = CKPT_DIR / "submission_partial.pkl"
-SUBMISSION_SAVE_INTERVAL = 20  # lưu checkpoint tạm sau mỗi 20 queries
+SUBMISSION_SAVE_INTERVAL_MIN = 20  # tối thiểu vẫn lưu mỗi 20 query (tập nhỏ)
+
+
+def _submission_save_interval(total_queries: int) -> int:
+    """Khoảng cách giữa 2 lần lưu checkpoint tạm khi tạo submission.
+
+    Luôn lưu tối thiểu SUBMISSION_SAVE_INTERVAL_MIN query/lần, nhưng nếu có
+    nhiều câu hỏi thì giãn ra để tổng số lần ghi (mỗi lần ghi lại toàn bộ
+    dict submission) không tăng theo n -> tránh I/O kiểu O(n^2).
+    """
+    return max(SUBMISSION_SAVE_INTERVAL_MIN, total_queries // 20)
 
 # ============ CONSTANTS ============
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -434,8 +455,10 @@ def generate_submission(
         logger.info(f" Resume submission từ checkpoint: đã có {len(submission)} queries")
 
     total = len(queries)
-    
+    save_interval = _submission_save_interval(total)
+
     logger.info(f" Đang tạo submission cho {total} queries...")
+    logger.info(f"   Lưu checkpoint tạm mỗi {save_interval} queries")
     
     for i, item in enumerate(tqdm(queries, desc="Processing queries")):
         qid = item.get("id", f"q_{i}")
@@ -458,7 +481,7 @@ def generate_submission(
         submission[qid_str] = {"answer": top_docs}
 
         # Lưu checkpoint tạm định kỳ, không đợi xử lý hết mới lưu
-        if (i + 1) % SUBMISSION_SAVE_INTERVAL == 0:
+        if (i + 1) % save_interval == 0:
             with open(SUBMISSION_CKPT, "wb") as f:
                 pickle.dump(submission, f)
             logger.info(f"    Checkpoint submission tạm: {len(submission)}/{total} queries")
