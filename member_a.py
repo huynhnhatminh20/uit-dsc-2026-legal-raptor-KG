@@ -313,7 +313,7 @@ def build_vector_store(emb=None):
         # Số lượng còn lại thường rất nhỏ (vài chục node cluster) nên
         # không cần checkpoint theo shard như encode_with_checkpoint,
         # encode thẳng 1 lần cho gọn.
-        missing_embeddings = np.asarray(embedder.encode(missing_texts, batch_size=64, show_progress_bar=True))
+        missing_embeddings = np.asarray(embedder.encode(missing_texts, batch_size=64))
     else:
         missing_embeddings = None
 
