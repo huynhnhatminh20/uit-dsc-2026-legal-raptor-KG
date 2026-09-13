@@ -24,40 +24,55 @@ logger = logging.getLogger(__name__)
 
 def _restore_checkpoint_from_input(folder_name: str, ckpt_dir: pathlib.Path):
     """
-    Nếu bạn đã Add Data một Dataset chứa checkpoint cũ (tải checkpoint về
-    máy từ 1 lần chạy trước, upload lại thành Dataset, gắn vào notebook qua
-    "Add Data"), hàm này tự tìm thư mục con tên đúng "{folder_name}" bên
-    trong /kaggle/input và copy các file còn thiếu vào /kaggle/working,
-    để build_...() nhận ra và resume tiếp mà không cần thao tác gì thêm.
-
-    Chỉ copy file NÀO CHƯA CÓ ở ckpt_dir (không ghi đè checkpoint mới hơn
-    đang có sẵn trong session hiện tại).
+    Khoi phuc checkpoint da luu tu lan chay truoc, theo thu tu uu tien:
+      1) Kaggle Input dataset - dung rglob (de qui MOI CAP thu muc con),
+         vi Kaggle co the mount o /kaggle/input/<slug>/... (kieu cu) hoac
+         /kaggle/input/datasets/<user>/<slug>/... (kieu moi, sau hon).
+      2) GitHub repo da git clone - checkpoints/{folder_name} (kieu cu)
+         hoac checkpoints/<ten_ngay>/{folder_name} (kieu moi, chon ngay
+         moi nhat) - chi dung khi Kaggle Input khong co.
+    Chi copy file CHUA CO o ckpt_dir (khong ghi de checkpoint moi hon dang co).
     """
+    def _copy_missing(src: pathlib.Path) -> int:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for f in src.iterdir():
+            dst = ckpt_dir / f.name
+            if f.is_file() and not dst.exists():
+                shutil.copy2(f, dst)
+                copied += 1
+        return copied
+
+    # --- Nguon 1: Kaggle Input (de qui, khong quan tam sau bao nhieu cap) ---
     input_root = pathlib.Path("/kaggle/input")
-    if not input_root.exists():
-        return
-
-    try:
-        for dataset_dir in input_root.iterdir():
-            if not dataset_dir.is_dir():
-                continue
-            # Tìm thư mục "{folder_name}" ngay trong dataset, hoặc lồng thêm 1 cấp
-            candidates = [dataset_dir / folder_name] + list(dataset_dir.glob(f"*/{folder_name}"))
-            for src in candidates:
+    if input_root.exists():
+        try:
+            for src in sorted(input_root.rglob(folder_name)):
                 if src.is_dir():
-                    ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    copied = 0
-                    for f in src.iterdir():
-                        dst = ckpt_dir / f.name
-                        if not dst.exists():
-                            shutil.copy2(f, dst)
-                            copied += 1
-                    if copied:
-                        logger.info(f" Đã khôi phục {copied} file checkpoint từ {src} -> {ckpt_dir}")
+                    n = _copy_missing(src)
+                    if n:
+                        logger.info(f" Đã khôi phục {n} file checkpoint từ {src} -> {ckpt_dir}")
                     return
-    except Exception as e:
-        logger.warning(f" Lỗi khi quét /kaggle/input để khôi phục checkpoint: {e}")
+        except Exception as e:
+            logger.warning(f" Lỗi khi quét /kaggle/input: {e}")
 
+    # --- Nguon 2: GitHub repo da git clone (bo sung neu Kaggle Input chua co) ---
+    repo_ckpt_root = pathlib.Path("uit-dsc-2026-legal-raptor-KG/checkpoints")
+    if repo_ckpt_root.exists():
+        try:
+            candidates = [repo_ckpt_root] + sorted(
+                (d for d in repo_ckpt_root.iterdir() if d.is_dir()),
+                reverse=True,  # ten dang ngay-gio -> moi nhat truoc
+            )
+            for base in candidates:
+                src = base / folder_name
+                if src.is_dir():
+                    n = _copy_missing(src)
+                    if n:
+                        logger.info(f" Đã khôi phục {n} file checkpoint từ {src} -> {ckpt_dir}")
+                    return
+        except Exception as e:
+            logger.warning(f" Lỗi khi quét GitHub repo checkpoints: {e}")
 
 # ============ CHECKPOINT CONFIG ============
 CKPT_DIR = pathlib.Path("/kaggle/working/A_checkpoint")
