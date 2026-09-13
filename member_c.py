@@ -125,10 +125,24 @@ class LegalModelWrapper:
                 trust_remote_code=True
             )
             
+            # [SỬA] device_map="auto" trên máy có NHIỀU GPU (vd Kaggle T4 x2)
+            # có thể chia layer không đều giữa các GPU, khiến 1 GPU bị dồn
+            # gần hết dung lượng trong lúc load dù model 4-bit lẽ ra chỉ cần
+            # vài GB -> OOM ngay khi load dù GPU còn kia gần như trống. Ép
+            # load hẳn vào 1 GPU duy nhất (đủ chỗ cho model 4-bit ~4B tham
+            # số) để tránh kiểu chia lệch này. Nếu máy chỉ có 1 GPU hoặc
+            # không có GPU, fallback về "auto"/CPU như cũ.
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                target_device_map = {"": 0}
+                logger.info("   Nhiều GPU phát hiện được -> ép load Legal LLM vào GPU 0 "
+                            "duy nhất (tránh device_map='auto' chia lệch gây OOM giả)")
+            else:
+                target_device_map = "auto"
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 LLM_MODEL,
                 quantization_config=bnb_config,
-                device_map="auto",
+                device_map=target_device_map,
                 trust_remote_code=True
             )
             
