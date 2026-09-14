@@ -223,21 +223,56 @@ def build_raptor(legal=None, emb=None):
     # 5. Tạo embeddings cho chunks (có checkpoint theo batch, resume được
     #    nếu bị ngắt giữa chừng thay vì encode lại từ đầu)
     texts = [c["text"] for c in chunks]
-    logger.info("   Encoding chunks...")
-    embeddings = encode_with_checkpoint(embedder, texts, EMBED_CKPT_CHUNKS, desc="Encoding chunks")
+    chunk_ids = [c["id"] for c in chunks]
 
-    # Lưu cache embeddings level-0 theo id để build_vector_store() TÁI SỬ
-    # DỤNG sau này thay vì encode lại toàn bộ chunk lần nữa (xem giải thích
-    # ở khai báo LEVEL0_EMBED_CACHE phía trên).
-    try:
-        np.savez(
-            str(LEVEL0_EMBED_CACHE),
-            ids=np.array([c["id"] for c in chunks], dtype=object),
-            vectors=embeddings.astype("float32"),
-        )
-        logger.info(f"   Đã lưu cache embedding level-0 ({len(chunks)} vectors) -> {LEVEL0_EMBED_CACHE}")
-    except Exception as e:
-        logger.warning(f" Không lưu được cache embedding level-0: {e}")
+    # [SỬA LỖI ĐẦY Ổ ĐĨA] Trước đây MỖI LẦN gọi build_raptor() (khi cây
+    # chưa xong hẳn level 2) đều encode lại TOÀN BỘ chunk từ đầu, dù
+    # level0_embeddings.npz (cache) đã có sẵn từ lần chạy trước -> vừa tốn
+    # GPU time vô ích, vừa khiến embed_shards_chunks/ (đang encode dở) và
+    # level0_embeddings.npz (cache mới lưu) CÙNG TỒN TẠI TRÊN ĐĨA CÙNG LÚC
+    # trong suốt lúc clustering/tóm tắt cluster phía sau (vì trước đây chỉ
+    # xóa shard dir sau khi CẢ CÂY xong hoàn toàn) -> double dung lượng
+    # đúng phần nặng nhất (embeddings), dễ gây crash "đầy ổ" giữa chừng.
+    #
+    # Giờ: nếu cache đã có VÀ khớp đúng bộ chunk hiện tại (so id) -> tái
+    # dùng luôn, không encode lại, không tạo shard dir mới -> tránh double
+    # hoàn toàn cho lần chạy này.
+    embeddings = None
+    if LEVEL0_EMBED_CACHE.exists():
+        try:
+            cache_data = np.load(str(LEVEL0_EMBED_CACHE), allow_pickle=True)
+            cached_ids = cache_data["ids"].tolist()
+            if cached_ids == chunk_ids:
+                embeddings = cache_data["vectors"]
+                logger.info(f"   Tái sử dụng {len(embeddings)} embedding level-0 đã cache "
+                            f"({LEVEL0_EMBED_CACHE}) -> khỏi encode lại")
+            else:
+                logger.warning(" Cache embedding level-0 không khớp bộ chunk hiện tại "
+                                "(khác dữ liệu/thứ tự) -> encode lại từ đầu")
+        except Exception as e:
+            logger.warning(f" Không đọc được cache embedding level-0, sẽ encode lại: {e}")
+
+    if embeddings is None:
+        logger.info("   Encoding chunks...")
+        embeddings = encode_with_checkpoint(embedder, texts, EMBED_CKPT_CHUNKS, desc="Encoding chunks")
+
+        # Lưu cache embeddings level-0 theo id để LẦN CHẠY SAU (nếu bị ngắt
+        # giữa chừng ở bước clustering) và build_vector_store() TÁI SỬ DỤNG,
+        # thay vì encode lại toàn bộ chunk lần nữa.
+        try:
+            np.savez(
+                str(LEVEL0_EMBED_CACHE),
+                ids=np.array(chunk_ids, dtype=object),
+                vectors=embeddings.astype("float32"),
+            )
+            logger.info(f"   Đã lưu cache embedding level-0 ({len(chunks)} vectors) -> {LEVEL0_EMBED_CACHE}")
+        except Exception as e:
+            logger.warning(f" Không lưu được cache embedding level-0: {e}")
+
+        # Đã có cache rồi -> xóa NGAY shard dir tạm, không đợi tới khi cả
+        # cây (level 0/1/2) xong mới xóa -> giảm hẳn cửa sổ double-disk.
+        if EMBED_CKPT_CHUNKS.exists():
+            shutil.rmtree(EMBED_CKPT_CHUNKS)
 
     # 6. Xây dựng cây RAPTOR (phiên bản tối ưu)
     tree = build_raptor_tree_optimized(chunks, embeddings, embedder, legal)
@@ -246,11 +281,6 @@ def build_raptor(legal=None, emb=None):
     with open(RAPTOR_CKPT, "wb") as f:
         pickle.dump(tree, f)
     logger.info(f" RAPTOR checkpoint lưu tại {RAPTOR_CKPT}")
-
-    # Đã build xong tree -> không cần checkpoint embedding trung gian nữa,
-    # xóa để tránh chiếm dung lượng ổ đĩa Kaggle không cần thiết.
-    if EMBED_CKPT_CHUNKS.exists():
-        shutil.rmtree(EMBED_CKPT_CHUNKS)
 
     return tree
 
