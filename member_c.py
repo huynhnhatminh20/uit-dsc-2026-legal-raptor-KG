@@ -282,7 +282,8 @@ class LegalReranker:
         
         Args:
             query: Câu hỏi
-            candidates: List [{"id": "doc1", "text": "..."}]
+            candidates: List [{"id": "doc1", "text": "..."}] hoặc
+                        [{"doc_id": "doc1", "passage": "..."}] (tương thích cả 2 format)
             top_k: Số lượng kết quả (mặc định 5, MAX 5 theo luật thi)
         
         Returns:
@@ -299,8 +300,16 @@ class LegalReranker:
         if not candidates:
             return []
         
+        # Hỗ trợ cả 2 format key: id/doc_id/document_id và text/passage/content
+        # (xungdot.md #3 - lệch tên trường dữ liệu)
+        def _get_text(c: Dict) -> str:
+            return c.get("text") or c.get("passage") or c.get("content") or ""
+
+        def _get_id(c: Dict) -> str:
+            return str(c.get("id") or c.get("doc_id") or c.get("document_id") or "")
+
         # Chuẩn bị pairs cho cross-encoder
-        pairs = [(query, c["text"]) for c in candidates]
+        pairs = [(query, _get_text(c)) for c in candidates]
         
         try:
             # Predict scores
@@ -315,8 +324,8 @@ class LegalReranker:
             result_ids = []
             seen = set()
             for i in sorted_indices:
-                cid = candidates[i]["id"]
-                if cid in seen:
+                cid = _get_id(candidates[i])
+                if not cid or cid in seen:
                     continue
                 seen.add(cid)
                 result_ids.append(cid)
@@ -328,8 +337,18 @@ class LegalReranker:
             
         except Exception as e:
             logger.warning(f" Reranker error: {e}")
-            # Fallback: return first candidates
-            return [c["id"] for c in candidates[:min(top_k, len(candidates))]]
+            # Fallback: return first candidates (robust với mọi key format)
+            result_ids = []
+            seen = set()
+            for c in candidates:
+                cid = _get_id(c)
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                result_ids.append(cid)
+                if len(result_ids) >= top_k:
+                    break
+            return result_ids
 
 
 # ============ EVALUATION ============
@@ -359,53 +378,85 @@ def evaluate_recall_precision(
     Đánh giá Recall@k và Precision@k
     
      QUAN TRỌNG: Nếu query có >5 documents → 0 điểm cho query đó
+     (theo docs/DSC2026_Task1_LegalIR_Data_Overview.docx:5 và LegalIR_Kaggle_Template_C.ipynb Cell 10)
     
     Args:
-        ground_truth: {query_id: [relevant_doc_ids]}
-        predictions: {query_id: [predicted_doc_ids]}
+        ground_truth: {query_id: {"answer": [relevant_doc_ids]}} hoặc {query_id: [relevant_doc_ids]}
+        predictions: {query_id: {"answer": [predicted_doc_ids]}} hoặc {query_id: [predicted_doc_ids]}
         k: Số lượng kết quả (mặc định 5)
     
     Returns:
         Dict với recall@k, precision@k, và thông báo lỗi
     """
-    recall_scores = []
-    precision_scores = []
+    recalls, precisions = [], []
     errors = []
-    
-    for qid, pred_value in predictions.items():
-        # Chấp nhận cả 2 dạng: {"qid": {"answer": [...]}} (đúng format
-        # submission.json thật của BTC) và {"qid": [...]} (dạng rút gọn cũ)
-        pred_docs = pred_value.get("answer", []) if isinstance(pred_value, dict) else pred_value
+    violated = 0
 
-        # KIỂM TRA: Không được vượt quá 5 documents
-        if len(pred_docs) > 5:
-            error_msg = f" Query {qid} trả về {len(pred_docs)} docs (tối đa 5) -> 0 điểm"
+    # Chuẩn hoá keys về str để tránh lệch int vs str (xungdot)
+    # và duyệt theo GT (ground_truth-driven) thay vì predictions-driven
+    # -> query có trong GT nhưng không có trong pred phải tính 0 điểm, không được bỏ qua
+    gt_norm = {str(qid): val for qid, val in ground_truth.items()}
+    pred_norm = {str(qid): val for qid, val in predictions.items()}
+
+    for qid, gt_item in gt_norm.items():
+        # GT: chấp nhận cả dạng {"answer": [...]} và [...] và {"question":..., "answer":[...]}
+        if isinstance(gt_item, dict):
+            gt = set(map(str, gt_item.get("answer", [])))
+        elif isinstance(gt_item, list):
+            gt = set(map(str, gt_item))
+        else:
+            gt = set()
+
+        # Pred: tương thích notebook Cell 10 logic
+        pred_entry = pred_norm.get(str(qid), [])
+        # pred_entry có thể là {"answer": [...]}, [...] hoặc {}
+        if isinstance(pred_entry, dict):
+            pred_raw = pred_entry.get("answer", [])
+            # fallback khi pred là {"qid": [...]} nhưng get nhầm dict rỗng
+            if isinstance(pred_raw, dict):
+                pred_raw = pred_raw.get("answer", [])
+        else:
+            pred_raw = pred_entry
+        if isinstance(pred_raw, dict):
+            pred_raw = pred_raw.get("answer", [])
+        # đảm bảo list
+        if pred_raw is None:
+            pred_raw = []
+        pred = list(map(str, pred_raw if isinstance(pred_raw, list) else []))
+
+        # Ràng buộc cuộc thi: >k → 0 điểm (k=5)
+        if len(pred) > k:
+            error_msg = f" Query {qid} trả về {len(pred)} docs (tối đa {k}) -> 0 điểm"
             errors.append(error_msg)
             logger.warning(error_msg)
-            recall_scores.append(0.0)
-            precision_scores.append(0.0)
+            recalls.append(0.0)
+            precisions.append(0.0)
+            violated += 1
             continue
-        
-        # ground_truth có thể là train.json gốc {"qid": {"question":..., "answer":[...]}}
-        # hoặc dạng rút gọn {"qid": [...]} -> chấp nhận cả 2.
-        gt_value = ground_truth.get(qid, [])
-        gt_docs = gt_value.get("answer", []) if isinstance(gt_value, dict) else gt_value
-        r5 = recall_at_k(pred_docs, gt_docs, k=k)
-        p5 = precision_at_k(pred_docs, gt_docs, k=k)
-        recall_scores.append(r5)
-        precision_scores.append(p5)
-    
+
+        if len(gt) == 0:
+            # Không có GT (như public-official) -> bỏ qua, không tính vào trung bình
+            continue
+        if len(pred) == 0:
+            recalls.append(0.0)
+            precisions.append(0.0)
+            continue
+        hit = len(gt & set(pred))
+        recalls.append(hit / len(gt) if len(gt) > 0 else 0.0)
+        precisions.append(hit / len(pred) if len(pred) > 0 else 0.0)
+
     # Tính trung bình
-    avg_recall = np.mean(recall_scores) if recall_scores else 0.0
-    avg_precision = np.mean(precision_scores) if precision_scores else 0.0
+    avg_recall = float(np.mean(recalls)) if recalls else 0.0
+    avg_precision = float(np.mean(precisions)) if precisions else 0.0
     
     result = {
         "recall": avg_recall,
         "precision": avg_precision,
         "recall@5": avg_recall,
         "precision@5": avg_precision,
-        "total_queries": len(predictions),
-        "violated": len(errors),
+        "n": len(recalls),
+        "total_queries": len(recalls),
+        "violated": violated,
         "errors": errors
     }
     
@@ -415,8 +466,8 @@ def evaluate_recall_precision(
     logger.info("="*50)
     logger.info(f" Recall@5:    {avg_recall:.4f}")
     logger.info(f" Precision@5: {avg_precision:.4f}")
-    logger.info(f" Tổng queries: {len(predictions)}")
-    logger.info(f" Lỗi (>5 docs): {len(errors)}")
+    logger.info(f" Tổng queries: {len(recalls)}")
+    logger.info(f" Lỗi (>5 docs): {violated}")
     logger.info("="*50)
     
     if avg_recall > 0.5:
