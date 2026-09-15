@@ -400,29 +400,69 @@ def evaluate_recall_precision(
 
     for qid, gt_item in gt_norm.items():
         # GT: chấp nhận cả dạng {"answer": [...]} và [...] và {"question":..., "answer":[...]}
-        if isinstance(gt_item, dict):
-            gt = set(map(str, gt_item.get("answer", [])))
+        # FIX: gt_item.get("answer", []) trả về None nếu JSON có "answer": null -> map(str, None) lỗi TypeError
+        # Dùng (x or []) và kiểm tra kiểu list để tránh 'NoneType' object is not iterable
+        if gt_item is None:
+            gt = set()
+        elif isinstance(gt_item, dict):
+            raw = gt_item.get("answer")
+            if raw is None:
+                raw = []
+            elif isinstance(raw, dict):
+                raw = raw.get("answer")
+                if raw is None:
+                    raw = []
+            if isinstance(raw, str):
+                raw = [raw]
+            elif isinstance(raw, (list, tuple, set)):
+                # lọc None bên trong list (vd: ["doc1", null])
+                raw = [x for x in raw if x is not None]
+            elif raw is None:
+                raw = []
+            else:
+                # kiểu lạ -> thử ép về list, nếu không được thì bỏ qua
+                try:
+                    raw = list(raw) if not isinstance(raw, str) else [raw]
+                except Exception:
+                    raw = []
+            gt = set(map(str, raw))
         elif isinstance(gt_item, list):
-            gt = set(map(str, gt_item))
+            gt = set(map(str, [x for x in gt_item if x is not None]))
         else:
             gt = set()
 
         # Pred: tương thích notebook Cell 10 logic
         pred_entry = pred_norm.get(str(qid), [])
-        # pred_entry có thể là {"answer": [...]}, [...] hoặc {}
-        if isinstance(pred_entry, dict):
-            pred_raw = pred_entry.get("answer", [])
+        # pred_entry có thể là {"answer": [...]}, [...] hoặc {} hoặc None
+        if pred_entry is None:
+            pred_raw = []
+        elif isinstance(pred_entry, dict):
+            pred_raw = pred_entry.get("answer")
+            if pred_raw is None:
+                pred_raw = []
             # fallback khi pred là {"qid": [...]} nhưng get nhầm dict rỗng
             if isinstance(pred_raw, dict):
-                pred_raw = pred_raw.get("answer", [])
+                tmp = pred_raw.get("answer")
+                pred_raw = tmp if tmp is not None else []
         else:
             pred_raw = pred_entry
         if isinstance(pred_raw, dict):
-            pred_raw = pred_raw.get("answer", [])
-        # đảm bảo list
+            tmp = pred_raw.get("answer")
+            pred_raw = tmp if tmp is not None else []
+        # đảm bảo list + lọc None
         if pred_raw is None:
             pred_raw = []
-        pred = list(map(str, pred_raw if isinstance(pred_raw, list) else []))
+        if isinstance(pred_raw, str):
+            pred_raw = [pred_raw]
+        elif isinstance(pred_raw, (list, tuple, set)):
+            pred_raw = [x for x in pred_raw if x is not None]
+        elif not isinstance(pred_raw, list):
+            try:
+                pred_raw = list(pred_raw) if not isinstance(pred_raw, str) else [pred_raw]
+                pred_raw = [x for x in pred_raw if x is not None]
+            except Exception:
+                pred_raw = []
+        pred = list(map(str, pred_raw))
 
         # Ràng buộc cuộc thi: >k → 0 điểm (k=5)
         if len(pred) > k:
