@@ -331,7 +331,7 @@ class LegalReranker:
         
         try:
             # Predict scores
-            scores = self.reranker.predict(pairs, batch_size=32)
+            scores = self.reranker.predict(pairs, batch_size=64)
             
             # Sort by score descending
             sorted_indices = np.argsort(scores)[::-1]

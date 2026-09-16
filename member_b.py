@@ -121,7 +121,7 @@ def _graph_ckpt_interval(total_nodes: int) -> int:
 LLM_ENTITY_EXTRACTION_MAX_NODES = 3000
 
 # ============ CONSTANTS ============
-RRF_K = 60
+RRF_K = 30
 MAX_CANDIDATES = 50
 EMBEDDING_MODEL = "BAAI/bge-m3"
 
@@ -353,7 +353,7 @@ def hybrid_retrieve(query: str, top_k: int = 50) -> List[Dict]:
     # Trọng số cho từng phương pháp
     weights = {
         "bm25": 1.0,
-        "dense": 1.2,  # Dense retrieval có trọng số cao hơn
+        "dense": 1.5,  # Tăng từ 1.2 -> 1.5 (tối ưu trên 200 mẫu, bge-m3 dense mạnh hơn BM25/graph)
         "graph": 1.0
     }
 
