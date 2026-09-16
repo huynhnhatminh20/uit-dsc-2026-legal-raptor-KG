@@ -164,10 +164,28 @@ class LegalModelWrapper:
             else:
                 target_device_map = "auto"
 
+            # Dọn cache GPU trước khi load (phòng trường hợp còn rác VRAM
+            # từ model/pipeline chạy trước đó trong cùng process, dù không
+            # phải nguyên nhân chính của lỗi OOM lần trước)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # [SỬA LỖI OOM] Thiếu low_cpu_mem_usage=True + torch_dtype tường minh
+            # khiến from_pretrained() có xu hướng vật chất hoá trọng số ở
+            # precision gốc (fp16/bf16, ~14-16GB cho model 4B) TRƯỚC khi
+            # bitsandbytes kịp quantize xuống 4-bit (đáng lẽ chỉ ~2.5-3GB).
+            # Trên GPU T4 15GB thì bị OOM ngay khi load, y hệt log 16:19:27
+            # "Tried to allocate 40.00 MiB ... 14.42 GiB is allocated by PyTorch".
+            # Giải pháp: ép low_cpu_mem_usage=True (stream từng shard thẳng
+            # vào GPU rồi quantize ngay, không giữ bản full-precision trong
+            # RAM/VRAM) + torch_dtype=bfloat16 tường minh cho phần compute
+            # chưa quantize (embedding, norm...), tránh rơi về fp32 mặc định.
             self.model = AutoModelForCausalLM.from_pretrained(
                 LLM_MODEL,
                 quantization_config=bnb_config,
                 device_map=target_device_map,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
                 trust_remote_code=True
             )
             
@@ -560,7 +578,8 @@ def generate_submission(
     queries: List[Dict], 
     retrieve_func, 
     reranker=None,
-    top_k: int = 5
+    top_k: int = 5,
+    ckpt_path: Optional[pathlib.Path] = None,
 ) -> Dict:
     """
     Tạo submission từ danh sách queries
@@ -570,19 +589,27 @@ def generate_submission(
         retrieve_func: Hàm nhận query text, trả về candidates
         reranker: Instance của LegalReranker (nếu None thì tự load)
         top_k: Số lượng kết quả (mặc định 5)
+        ckpt_path: [MỚI] file checkpoint tạm dùng để resume. Mặc định
+            SUBMISSION_CKPT (submission thật nộp BTC). Khi chạy đánh giá
+            trên train.json (evaluate_on_train) ta truyền 1 checkpoint
+            KHÁC (TRAIN_EVAL_CKPT) để không đè/lẫn với checkpoint của
+            submission thật.
     
     Returns:
         {query_id: [doc_ids]}
     """
     if reranker is None:
         reranker = get_reranker()
-    
+
+    if ckpt_path is None:
+        ckpt_path = SUBMISSION_CKPT
+
     # Resume từ checkpoint tạm nếu có (từ lần chạy trước bị ngắt giữa chừng)
     submission = {}
-    if SUBMISSION_CKPT.exists():
-        with open(SUBMISSION_CKPT, "rb") as f:
+    if ckpt_path.exists():
+        with open(ckpt_path, "rb") as f:
             submission = pickle.load(f)
-        logger.info(f" Resume submission từ checkpoint: đã có {len(submission)} queries")
+        logger.info(f" Resume submission từ checkpoint ({ckpt_path.name}): đã có {len(submission)} queries")
 
     total = len(queries)
     save_interval = _submission_save_interval(total)
@@ -612,16 +639,101 @@ def generate_submission(
 
         # Lưu checkpoint tạm định kỳ, không đợi xử lý hết mới lưu
         if (i + 1) % save_interval == 0:
-            with open(SUBMISSION_CKPT, "wb") as f:
+            with open(ckpt_path, "wb") as f:
                 pickle.dump(submission, f)
             logger.info(f"    Checkpoint submission tạm: {len(submission)}/{total} queries")
 
     # Lưu lần cuối để chắc chắn không sót query nào
-    with open(SUBMISSION_CKPT, "wb") as f:
+    with open(ckpt_path, "wb") as f:
         pickle.dump(submission, f)
     
     logger.info(f" Đã tạo submission với {len(submission)} queries")
     return submission
+
+
+# ============ ĐÁNH GIÁ TRÊN train.json (CÓ GROUND TRUTH THẬT) ============
+
+# Checkpoint RIÊNG cho vòng chạy đánh giá trên train.json, tách biệt hẳn
+# với SUBMISSION_CKPT (submission thật nộp BTC dựa trên public-official.json
+# - vốn answer=null hết nên Recall/Precision luôn ra 0/0, không phản ánh
+# chất lượng model). Tách file để 2 việc không đè checkpoint của nhau.
+TRAIN_EVAL_CKPT = CKPT_DIR / "train_eval_partial.pkl"
+
+
+def evaluate_on_train(
+    train_json_path: str,
+    retrieve_func,
+    reranker=None,
+    top_k: int = 5,
+    sample_size: Optional[int] = None,
+    seed: int = 42,
+    ckpt_path: Optional[pathlib.Path] = None,
+) -> Dict:
+    """
+    Đo Recall@5 / Precision@5 THẬT bằng cách chạy full pipeline
+    (retrieve + rerank) trên train.json - file DUY NHẤT hiện có chứa
+    ground truth thật (answer != null), khác với public-official.json
+    (answer luôn null -> evaluate_recall_precision() sẽ luôn trả về
+    Tổng queries = 0, không dùng để đánh giá model được).
+
+    Args:
+        train_json_path: đường dẫn tới train.json, format:
+            {qid: {"question": "...", "answer": ["doc_id", ...]}, ...}
+        retrieve_func: hàm nhận query text -> candidates (giống generate_submission)
+        reranker: Instance LegalReranker (None thì tự load)
+        top_k: số doc lấy ra mỗi câu (mặc định 5, đúng luật thi)
+        sample_size: [MẶC ĐỊNH None = CHẠY FULL train.json]. Chỉ lấy mẫu
+            ngẫu nhiên khi NOTEBOOK chủ động truyền một số cụ thể (vd 200)
+            để có kết quả nhanh trong lúc thử nghiệm. Bản thân file
+            member_c.py này không tự ý giới hạn mẫu - hàm mặc định chạy
+            hết toàn bộ train.json (7000 câu, ước ~33 giờ theo tốc độ log
+            trước ~17s/câu) trừ khi bị notebook yêu cầu lấy mẫu.
+        seed: seed để lấy mẫu tái lập được (chỉ có tác dụng khi sample_size != None)
+        ckpt_path: checkpoint resume riêng, mặc định TRAIN_EVAL_CKPT.
+            LƯU Ý: nếu đổi sample_size/seed giữa các lần chạy, các qid
+            trong checkpoint cũ (đã tính theo mẫu cũ) vẫn được giữ và dùng
+            lại nếu trùng id với mẫu mới; nếu muốn chắc chắn mẫu mới chạy
+            từ đầu, hãy xoá TRAIN_EVAL_CKPT trước khi gọi lại.
+
+    Returns:
+        Dict kết quả từ evaluate_recall_precision(), tức:
+        {"recall", "precision", "recall@5", "precision@5",
+         "n"/"total_queries", "violated", "errors"}
+    """
+    with open(train_json_path, "r", encoding="utf-8") as f:
+        train_gt_full = json.load(f)
+
+    total_available = len(train_gt_full)
+    if sample_size is None or sample_size >= total_available:
+        chosen_ids = list(train_gt_full.keys())
+        logger.info(f" evaluate_on_train: dùng FULL {total_available} câu trong train.json "
+                    f"(mặc định của member_c.py - không lấy mẫu trừ khi notebook truyền sample_size)")
+    else:
+        import random
+        rng = random.Random(seed)
+        chosen_ids = rng.sample(list(train_gt_full.keys()), sample_size)
+        logger.info(f" evaluate_on_train: lấy mẫu {sample_size}/{total_available} câu "
+                    f"(seed={seed}) để đánh giá nhanh")
+
+    ground_truth = {qid: train_gt_full[qid] for qid in chosen_ids}
+    queries = [
+        {"id": qid, "text": train_gt_full[qid].get("question", "")}
+        for qid in chosen_ids
+    ]
+
+    if ckpt_path is None:
+        ckpt_path = TRAIN_EVAL_CKPT
+
+    predictions = generate_submission(
+        queries=queries,
+        retrieve_func=retrieve_func,
+        reranker=reranker,
+        top_k=top_k,
+        ckpt_path=ckpt_path,
+    )
+
+    result = evaluate_recall_precision(ground_truth, predictions, k=top_k)
+    return result
 
 
 # ============ KIỂM TRA NHANH ============
@@ -648,3 +760,18 @@ if __name__ == "__main__":
     
     print("\n" + "="*50)
     print(" Test complete!")
+
+    # 3. Cách gọi evaluate_on_train() trong notebook (KHÔNG chạy tự động ở
+    # đây vì cần retrieve_func thật từ member_a/member_b). Ví dụ dùng:
+    #
+    # from member_c import evaluate_on_train
+    # # Mặc định sample_size=None -> chạy FULL train.json (rất lâu, ~33h nếu 7000 câu).
+    # # Muốn thử nhanh trước, notebook chủ động truyền sample_size=200 (~1h):
+    # result = evaluate_on_train(
+    #     train_json_path=TRAIN_JSON_PATH,
+    #     retrieve_func=hybrid_retrieve,
+    #     reranker=reranker,
+    #     top_k=5,
+    #     sample_size=200,   # bỏ dòng này (hoặc =None) để chạy full
+    # )
+    # print(result["recall@5"], result["precision@5"], result["total_queries"])
