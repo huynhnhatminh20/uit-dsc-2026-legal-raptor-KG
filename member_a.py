@@ -36,10 +36,26 @@ def _restore_checkpoint_from_input(folder_name: str, ckpt_dir: pathlib.Path):
     def _copy_missing(src: pathlib.Path) -> int:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         copied = 0
-        for f in src.iterdir():
-            dst = ckpt_dir / f.name
-            if f.is_file() and not dst.exists():
-                shutil.copy2(f, dst)
+        for item in src.iterdir():
+            dst = ckpt_dir / item.name
+            if dst.exists():
+                # Merge thu muc: neu ca src va dst deu la thu muc thi copy
+                # nhung file con CHUA CO (vd embed_shards_chunks/part_*.npy)
+                if item.is_dir() and dst.is_dir():
+                    for sub in item.rglob("*"):
+                        if sub.is_file():
+                            rel = sub.relative_to(item)
+                            dst_sub = dst / rel
+                            if not dst_sub.exists():
+                                dst_sub.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(sub, dst_sub)
+                                copied += 1
+                continue
+            if item.is_file():
+                shutil.copy2(item, dst)
+                copied += 1
+            elif item.is_dir():
+                shutil.copytree(item, dst)
                 copied += 1
         return copied
 
@@ -52,7 +68,8 @@ def _restore_checkpoint_from_input(folder_name: str, ckpt_dir: pathlib.Path):
                     n = _copy_missing(src)
                     if n:
                         logger.info(f" Đã khôi phục {n} file checkpoint từ {src} -> {ckpt_dir}")
-                    return
+                        return
+                    # neu thu muc trong thi thu nguon khac
         except Exception as e:
             logger.warning(f" Lỗi khi quét /kaggle/input: {e}")
 
@@ -70,7 +87,7 @@ def _restore_checkpoint_from_input(folder_name: str, ckpt_dir: pathlib.Path):
                     n = _copy_missing(src)
                     if n:
                         logger.info(f" Đã khôi phục {n} file checkpoint từ {src} -> {ckpt_dir}")
-                    return
+                        return
         except Exception as e:
             logger.warning(f" Lỗi khi quét GitHub repo checkpoints: {e}")
 
