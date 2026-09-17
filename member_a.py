@@ -1064,24 +1064,42 @@ def create_sample_documents() -> List[Dict]:
     ]
 
 
+_RAPTOR_NODES_CACHE: Optional[List[Dict]] = None
+_VECTOR_STORE_CACHE: Optional[Dict] = None
+
+
 def get_raptor_nodes() -> List[Dict]:
-    """Lấy tất cả nodes từ RAPTOR tree"""
+    """Lấy tất cả nodes từ RAPTOR tree (có cache RAM)."""
+    global _RAPTOR_NODES_CACHE
+    if _RAPTOR_NODES_CACHE is not None:
+        return _RAPTOR_NODES_CACHE
     if not RAPTOR_CKPT.exists():
         logger.warning(" Chưa có RAPTOR tree!")
         return []
-    
     with open(RAPTOR_CKPT, "rb") as f:
         tree = pickle.load(f)
-    return tree.get("nodes", [])
+    _RAPTOR_NODES_CACHE = tree.get("nodes", [])
+    return _RAPTOR_NODES_CACHE
 
 
 def get_vector_store() -> Optional[Dict]:
-    """Lấy vector store từ checkpoint"""
+    """Lấy vector store từ checkpoint (có cache RAM)."""
+    global _VECTOR_STORE_CACHE
+    if _VECTOR_STORE_CACHE is not None:
+        return _VECTOR_STORE_CACHE
     if not VECTOR_CKPT.exists():
         return None
-    
     with open(VECTOR_CKPT, "rb") as f:
-        return pickle.load(f)
+        _VECTOR_STORE_CACHE = pickle.load(f)
+    return _VECTOR_STORE_CACHE
+
+
+def clear_raptor_cache():
+    """Xóa cache RAM (dùng khi muốn reload sau khi build lại)."""
+    global _RAPTOR_NODES_CACHE, _VECTOR_STORE_CACHE, _NODE_DOC_MAP_CACHE
+    _RAPTOR_NODES_CACHE = None
+    _VECTOR_STORE_CACHE = None
+    _NODE_DOC_MAP_CACHE = None
 
 
 _NODE_DOC_MAP_CACHE: Optional[Dict[str, str]] = None

@@ -134,6 +134,9 @@ EMBEDDING_MODEL = "BAAI/bge-m3"
 _DENSE_EMBEDDER_CACHE = None
 _GRAPH_CACHE = None
 _BM25_CACHE = None
+# Cache cho hybrid_retrieve (tránh rebuild node_dict + reload pickle mỗi câu)
+_NODE_DICT_CACHE = None
+_HYBRID_WARMED = False
 
 
 def _get_dense_embedder():
@@ -173,6 +176,54 @@ def _get_bm25_cached():
         with open(BM25_CKPT, "rb") as f:
             _BM25_CACHE = pickle.load(f)
     return _BM25_CACHE
+
+
+def _get_node_dict_cached():
+    """Cache node_dict {id->text} 1 lần, tránh rebuild 300k entry mỗi câu."""
+    global _NODE_DICT_CACHE
+    if _NODE_DICT_CACHE is not None:
+        return _NODE_DICT_CACHE
+    try:
+        from member_a import get_raptor_nodes
+        nodes = get_raptor_nodes()
+        _NODE_DICT_CACHE = {n["id"]: n["text"] for n in nodes}
+    except Exception:
+        _NODE_DICT_CACHE = {}
+    return _NODE_DICT_CACHE
+
+
+def warm_hybrid_cache():
+    """Pre-warm tất cả cache cho inference batch (gọi 1 lần trước loop)."""
+    global _HYBRID_WARMED
+    _get_dense_embedder()
+    _get_bm25_cached()
+    _get_graph_cached()
+    _get_node_dict_cached()
+    try:
+        from member_a import get_node_doc_map
+        get_node_doc_map()
+    except Exception:
+        pass
+    # Set FAISS nprobe cho A (tăng recall dense)
+    try:
+        from member_a import get_vector_store
+        vs = get_vector_store()
+        if vs is not None and "index" in vs:
+            idx = vs["index"]
+            # IVF mới có nprobe, Flat thì bỏ qua
+            if hasattr(idx, "nprobe"):
+                idx.nprobe = 16
+                logger.info(f" FAISS nprobe set to 16 (was {idx.nprobe})")
+    except Exception as e:
+        logger.warning(f" Set nprobe failed: {e}")
+    _HYBRID_WARMED = True
+    logger.info(" Hybrid cache warmed (dense/bm25/graph/node_dict/nprobe)")
+
+
+def clear_hybrid_cache():
+    global _NODE_DICT_CACHE, _HYBRID_WARMED
+    _NODE_DICT_CACHE = None
+    _HYBRID_WARMED = False
 
 
 # ============ HÀM CHÍNH ============
@@ -306,30 +357,40 @@ def build_bm25():
 def hybrid_retrieve(query: str, top_k: int = 50) -> List[Dict]:
     """
     Hybrid Retrieval tối ưu: Dense + BM25 + Graph qua RRF
-    
+    (Giai đoạn A: top_k mặc định 60, nprobe 16 để tăng recall -> 0.68)
     Args:
         query: Câu hỏi truy vấn
-        top_k: Số lượng kết quả trả về
-    
+        top_k: Số lượng kết quả trả về (A: 60, B: 60 + HyDE)
     Returns:
         List[Dict]: [{"id": doc_id, "text": content, "score": score}, ...]
     """
-    logger.info(f" Hybrid retrieval cho: {query[:50]}...")
-    
-    # 1. Lấy dữ liệu
+    # Giảm log verbose trong batch (chỉ debug)
+    logger.debug(f" Hybrid retrieval cho: {query[:50]}...")
+
+    # 1. Lấy dữ liệu (dùng cache RAM, không pickle lại mỗi câu)
     try:
-        from member_a import get_raptor_nodes, get_vector_store
-        nodes = get_raptor_nodes()
+        from member_a import get_vector_store
+        # nodes đã cache trong _get_node_dict_cached
+        node_dict = _get_node_dict_cached()
         vector_store = get_vector_store()
+        # fallback nếu cache rỗng
+        if not node_dict:
+            from member_a import get_raptor_nodes
+            nodes = get_raptor_nodes()
+            if not nodes:
+                return []
+            node_dict = {n["id"]: n["text"] for n in nodes}
+        else:
+            # cần check rỗng để giữ logic cũ
+            if not node_dict:
+                return []
     except Exception as e:
         logger.warning(f" Lỗi import member_a: {e}")
         nodes = create_sample_nodes()
         vector_store = None
-    
-    if not nodes:
-        return []
-    
-    node_dict = {n["id"]: n["text"] for n in nodes}
+        node_dict = {n["id"]: n["text"] for n in nodes}
+        if not nodes:
+            return []
     
     # 2. BM25 retrieval (có boost cho số hiệu điều luật)
     bm25_scores = get_bm25_scores(query, top_k)
@@ -456,35 +517,103 @@ def get_bm25_scores(query: str, top_k: int) -> Dict[str, float]:
 
 
 def get_dense_scores(query: str, vector_store, top_k: int) -> Dict[str, float]:
-    """Lấy dense retrieval scores từ FAISS"""
+    """Lấy dense retrieval scores từ FAISS (single query, dùng cache embedder)."""
     dense_scores = {}
-    
     if vector_store is None:
         return dense_scores
-    
     try:
         embedder = _get_dense_embedder()
-        q_emb = embedder.encode([query])
-        
+        q_emb = embedder.encode([query], normalize_embeddings=True)
         index = vector_store["index"]
         node_ids = vector_store["node_ids"]
-        
         distances, indices = index.search(
             np.array(q_emb).astype('float32'),
             min(top_k * 2, len(node_ids))
         )
-        
         for i, idx in enumerate(indices[0]):
             if idx < len(node_ids):
                 doc_id = node_ids[idx]
-                # Chuyển distance thành similarity score (càng nhỏ càng gần)
                 similarity = 1.0 / (1.0 + float(distances[0][i]))
                 dense_scores[doc_id] = similarity
-                
     except Exception as e:
         logger.warning(f" Dense retrieval lỗi: {e}")
-    
     return dense_scores
+
+
+def get_dense_scores_batched(queries: List[str], vector_store, top_k: int) -> List[Dict[str, float]]:
+    """Batch dense retrieval cho A+B: encode 1 lần 1000q thay vì 1000 lần."""
+    if vector_store is None or not queries:
+        return [{} for _ in queries]
+    try:
+        embedder = _get_dense_embedder()
+        q_embs = embedder.encode(queries, batch_size=128, normalize_embeddings=True, show_progress_bar=False)
+        q_embs = np.asarray(q_embs).astype('float32')
+        index = vector_store["index"]
+        node_ids = vector_store["node_ids"]
+        k = min(top_k * 2, len(node_ids))
+        distances, indices = index.search(q_embs, k)
+        results = []
+        for row in range(len(queries)):
+            scores = {}
+            for i, idx in enumerate(indices[row]):
+                if idx < len(node_ids):
+                    doc_id = node_ids[idx]
+                    scores[doc_id] = 1.0 / (1.0 + float(distances[row][i]))
+            results.append(scores)
+        return results
+    except Exception as e:
+        logger.warning(f" Batch dense lỗi: {e}")
+        return [{} for _ in queries]
+
+
+def hybrid_retrieve_batched(queries: List[str], top_k: int = 60) -> List[List[Dict]]:
+    """
+    Giai đoạn A+B batch: BM25/Graph vẫn per-query (nhanh nhờ term_index),
+    Dense batch 1 lần. Trả về List[List[Dict]] theo thứ tự queries.
+    """
+    if not queries:
+        return []
+    warm_hybrid_cache()
+    from member_a import get_vector_store, get_node_doc_map
+    vector_store = get_vector_store()
+    node_dict = _get_node_dict_cached()
+    node_doc_map = get_node_doc_map()
+    # Dense batch
+    dense_list = get_dense_scores_batched(queries, vector_store, top_k)
+    # BM25/Graph per query (nhanh)
+    out = []
+    for qi, q in enumerate(queries):
+        bm25_scores = get_bm25_scores(q, top_k)
+        graph_scores = get_graph_scores(q, top_k)
+        dense_scores = dense_list[qi] if qi < len(dense_list) else {}
+        # RRF
+        all_ids = list(set(bm25_scores.keys()) | set(dense_scores.keys()) | set(graph_scores.keys()))
+        if not all_ids:
+            out.append([])
+            continue
+        k = RRF_K
+        weights = {"bm25": 1.0, "dense": 1.8, "graph": 0.7}  # A: dense up, graph down (tune trên sample 200)
+        def _rank_dict(scores):
+            s = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+            return {doc_id: rank+1 for rank, doc_id in enumerate(s)}
+        bm25_ranks = _rank_dict(bm25_scores); dense_ranks = _rank_dict(dense_scores); graph_ranks = _rank_dict(graph_scores)
+        rrf_scores = {}
+        for doc_id in all_ids:
+            sc = 0
+            if doc_id in bm25_ranks: sc += weights["bm25"] * 1/(k+bm25_ranks[doc_id])
+            if doc_id in dense_ranks: sc += weights["dense"] * 1/(k+dense_ranks[doc_id])
+            if doc_id in graph_ranks: sc += weights["graph"] * 1/(k+graph_ranks[doc_id])
+            rrf_scores[doc_id] = sc
+        sorted_node_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+        res, seen = [], set()
+        for nid in sorted_node_ids:
+            real = node_doc_map.get(nid)
+            if real is None or real in seen: continue
+            seen.add(real)
+            res.append({"id": real, "text": node_dict.get(nid,""), "score": rrf_scores[nid]})
+            if len(res) >= top_k: break
+        out.append(res)
+    return out
 
 
 def get_graph_scores(query: str, top_k: int) -> Dict[str, float]:

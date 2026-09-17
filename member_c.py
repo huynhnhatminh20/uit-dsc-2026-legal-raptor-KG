@@ -297,76 +297,106 @@ class LegalReranker:
     def rerank(self, query: str, candidates: List[Dict], top_k: int = 5) -> List[str]:
         """
         Rerank candidates và trả về top_k document IDs
-        
-        Args:
-            query: Câu hỏi
-            candidates: List [{"id": "doc1", "text": "..."}] hoặc
-                        [{"doc_id": "doc1", "passage": "..."}] (tương thích cả 2 format)
-            top_k: Số lượng kết quả (mặc định 5, MAX 5 theo luật thi)
-        
-        Returns:
-            List[str]: Danh sách document IDs (tối đa 5)
+        (Giữ nguyên để tương thích, batch thực tế dùng rerank_batched)
         """
-        # LUẬT THI: TỐI ĐA 5 DOCUMENTS
+        return self.rerank_batched([query], [candidates], top_k=top_k)[0]
+
+    def rerank_batched(self, queries: List[str], candidates_list: List[List[Dict]], top_k: int = 5) -> List[List[str]]:
+        """
+        Giai đoạn A+B batch: gom tất cả pairs (60k với 1000q*60) predict 1 lần batch=256 + half
+        Thay vì 1000 lần predict(30 pairs, batch=64) -> 1000 GPU launch -> 1 lần ~12-24s
+        """
         if top_k > 5:
             logger.warning(f" top_k={top_k} vượt quá 5, tự động giới hạn xuống 5")
             top_k = 5
-        
         if self.reranker is None:
             self.load()
-        
-        if not candidates:
+        if not queries or not candidates_list:
             return []
-        
-        # Hỗ trợ cả 2 format key: id/doc_id/document_id và text/passage/content
-        # (xungdot.md #3 - lệch tên trường dữ liệu)
+        # Hỗ trợ cả 2 format
         def _get_text(c: Dict) -> str:
             return c.get("text") or c.get("passage") or c.get("content") or ""
-
         def _get_id(c: Dict) -> str:
             return str(c.get("id") or c.get("doc_id") or c.get("document_id") or "")
-
-        # Chuẩn bị pairs cho cross-encoder
-        pairs = [(query, _get_text(c)) for c in candidates]
-        
+        # Gom pairs + index map
+        all_pairs = []
+        offsets = []  # (start, end) per query
+        for q, cands in zip(queries, candidates_list):
+            start = len(all_pairs)
+            for c in (cands or []):
+                all_pairs.append((q, _get_text(c)))
+            offsets.append((start, len(all_pairs)))
+        if not all_pairs:
+            return [[] for _ in queries]
         try:
-            # Predict scores
-            scores = self.reranker.predict(pairs, batch_size=64)
-            
-            # Sort by score descending
-            sorted_indices = np.argsort(scores)[::-1]
-            
-            # Lấy top_k ID, khử trùng lặp (phòng hờ nếu candidates còn sót
-            # 2 chunk khác nhau của CÙNG 1 document_id - chỉ giữ bản có
-            # điểm rerank cao nhất, tránh lãng phí 1 trong 5 slot cho phép)
-            result_ids = []
-            seen = set()
-            for i in sorted_indices:
-                cid = _get_id(candidates[i])
-                if not cid or cid in seen:
+            # Half precision trên CUDA giảm 30% thời gian + VRAM
+            try:
+                if self.device == "cuda" and hasattr(self.reranker, "model"):
+                    self.reranker.model.half()
+            except Exception:
+                pass
+            scores = self.reranker.predict(all_pairs, batch_size=256, show_progress_bar=False)
+            scores = __import__("numpy").asarray(scores)
+            results = []
+            for (start, end), cands in zip(offsets, candidates_list):
+                if start >= end or not cands:
+                    results.append([])
                     continue
-                seen.add(cid)
-                result_ids.append(cid)
-                if len(result_ids) >= top_k:
-                    break
-            
-            logger.info(f" Reranked {len(candidates)} candidates -> {len(result_ids)} docs (unique)")
-            return result_ids
-            
+                q_scores = scores[start:end]
+                sorted_idx = __import__("numpy").argsort(q_scores)[::-1]
+                seen=set(); res=[]
+                for i in sorted_idx:
+                    cid=_get_id(cands[i])
+                    if not cid or cid in seen: continue
+                    seen.add(cid); res.append(cid)
+                    if len(res)>=top_k: break
+                if not res:
+                    seen=set()
+                    for c in cands:
+                        cid=_get_id(c)
+                        if not cid or cid in seen: continue
+                        seen.add(cid); res.append(cid)
+                        if len(res)>=top_k: break
+                results.append(res)
+            logger.info(f" Reranked batch {len(queries)} queries {len(all_pairs)} pairs")
+            return results
         except Exception as e:
-            logger.warning(f" Reranker error: {e}")
-            # Fallback: return first candidates (robust với mọi key format)
-            result_ids = []
-            seen = set()
-            for c in candidates:
-                cid = _get_id(c)
-                if not cid or cid in seen:
-                    continue
-                seen.add(cid)
-                result_ids.append(cid)
-                if len(result_ids) >= top_k:
-                    break
-            return result_ids
+            logger.warning(f" Reranker batch error: {e}")
+            results=[]
+            for cands in candidates_list:
+                seen=set(); res=[]
+                for c in (cands or []):
+                    cid=_get_id(c)
+                    if not cid or cid in seen: continue
+                    seen.add(cid); res.append(cid)
+                    if len(res)>=top_k: break
+                results.append(res)
+            return results
+
+
+# ============ HyDE QUERY EXPANSION (Giai đoạn B -> 0.70) ============
+
+def generate_hyde_docs(queries, legal=None, max_new_tokens=80, batch_size=8):
+    """Sinh hypo document cho mỗi query bằng Legal LLM (HyDE). Batch theo loop, 80 tokens ~0.4s/q trên T4."""
+    if legal is None or getattr(legal, "model", None) is None:
+        logger.warning(" HyDE: legal LLM chưa load -> bỏ qua expansion, dùng query gốc")
+        return ["" for _ in queries]
+    hyde_docs=[]
+    for i in range(0, len(queries), batch_size):
+        batch = queries[i:i+batch_size]
+        for q in batch:
+            prompt = f"Viet 1 doan van ban phap luat gia dinh (80 tu) tra loi cau hoi: {q[:300]}"
+            try:
+                hypo = legal.generate(prompt, max_length=max_new_tokens)
+                # Cắt bỏ prompt nếu model trả cả prompt
+                if prompt in hypo:
+                    hypo = hypo.split(prompt)[-1].strip()
+                hyde_docs.append(hypo[:500])
+            except Exception as e:
+                logger.warning(f" HyDE fail q{i}: {e}")
+                hyde_docs.append("")
+    logger.info(f" HyDE done {len(hyde_docs)}/{len(queries)} docs")
+    return hyde_docs
 
 
 # ============ EVALUATION ============
