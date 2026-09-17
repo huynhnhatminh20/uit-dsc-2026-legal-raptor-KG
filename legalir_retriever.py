@@ -20,7 +20,12 @@ import faiss
 import numpy as np
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
-from tqdm.auto import tqdm
+# NOTE: intentionally tqdm.std, not tqdm.auto. In Jupyter/Kaggle, tqdm.auto
+# renders as an ipywidget progress bar, which draws directly in the notebook
+# UI and writes nothing to stdout — so it is completely invisible in a text
+# log (e.g. Kaggle's "Log" tab, or output piped/saved to a file). tqdm.std is
+# a plain text bar (uses \r to update in place) that always shows up there.
+from tqdm.std import tqdm
 
 LOG = logging.getLogger("legalir")
 EMBED_MODEL = "BAAI/bge-m3"
