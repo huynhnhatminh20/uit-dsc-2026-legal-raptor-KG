@@ -25,8 +25,11 @@ from tqdm.auto import tqdm
 LOG = logging.getLogger("legalir")
 EMBED_MODEL = "BAAI/bge-m3"
 RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
-SEGMENT_CHARS = 1_200
-SEGMENT_OVERLAP = 220
+# Long enough to retain a legal provision; a cap prevents one exceptionally
+# long source document from dominating the index and build time.
+SEGMENT_CHARS = 1_600
+SEGMENT_OVERLAP = 160
+MAX_SEGMENTS_PER_DOCUMENT = 48
 BM25_DEPTH = 2_500
 DENSE_DEPTH = 2_500
 # 120 is enough after document-level fusion and halves cross-encoder work
@@ -50,18 +53,24 @@ def _fingerprint(context_dir: str) -> str:
         h.update(path.name.encode())
         h.update(str(stat.st_size).encode())
         h.update(str(stat.st_mtime_ns).encode())
-    h.update(f"{EMBED_MODEL}|{SEGMENT_CHARS}|{SEGMENT_OVERLAP}|ivf{IVF_NPROBE}".encode())
+    h.update(f"{EMBED_MODEL}|{SEGMENT_CHARS}|{SEGMENT_OVERLAP}|cap{MAX_SEGMENTS_PER_DOCUMENT}|ivf{IVF_NPROBE}".encode())
     return h.hexdigest()[:20]
 
 
 def _legal_segments(text: str, title: str) -> Iterable[str]:
-    """Never truncate a long Điều: split at legal headers, then sliding windows."""
+    """Lossless, bounded segmentation for heterogeneous legal source files.
+
+    Do not split on generic ``1.`` / ``2.`` markers: in this corpus they also
+    occur in dates, citations, tables, and footnotes, which previously exploded
+    the corpus above one million segments.  Article boundaries are useful; all
+    other long text is covered by overlapping windows.
+    """
     clean = re.sub(r"\r\n?", "\n", text)
     clean = re.sub(r"[ \t]+", " ", clean)
-    # A boundary is retained in the following part so article/clause evidence is
-    # present in the embedding and reranker input.
-    units = re.split(r"(?=\n?\s*(?:Điều\s+\d+[A-Za-z]?|Khoản\s+\d+[A-Za-z]?|\d+\s*[\.)]))", clean,
-                     flags=re.IGNORECASE)
+    # Keep Điều with the following block.  Do NOT use every numeric clause as a
+    # split boundary; it is not a reliable structural signal in these files.
+    units = re.split(r"(?im)(?=^\s*Điều\s+\d+[A-Za-z]?\s*[\.:])", clean)
+    all_parts = []
     for unit in units:
         unit = unit.strip()
         if len(unit) < 35:
@@ -69,9 +78,16 @@ def _legal_segments(text: str, title: str) -> Iterable[str]:
         for start in range(0, len(unit), SEGMENT_CHARS - SEGMENT_OVERLAP):
             part = unit[start:start + SEGMENT_CHARS].strip()
             if len(part) >= 35:
-                yield f"[VĂN BẢN: {title}]\n{part}"
+                all_parts.append(f"[VĂN BẢN: {title}]\n{part}")
             if start + SEGMENT_CHARS >= len(unit):
                 break
+    # Preserve coverage across the whole document, including its tail, while
+    # bounding pathological multi-megabyte contexts.
+    if len(all_parts) <= MAX_SEGMENTS_PER_DOCUMENT:
+        yield from all_parts
+    else:
+        positions = np.linspace(0, len(all_parts) - 1, MAX_SEGMENTS_PER_DOCUMENT, dtype=int)
+        yield from (all_parts[i] for i in positions)
 
 
 def _read_documents(context_dir: str) -> List[Tuple[str, str, str]]:
@@ -137,7 +153,7 @@ class LegalIRRetriever:
             if shard.exists():
                 continue
             start, end = b * shard_size, min((b + 1) * shard_size, len(texts))
-            vector = self.embedder.encode(texts[start:end], batch_size=96, show_progress_bar=False,
+            vector = self.embedder.encode(texts[start:end], batch_size=128, show_progress_bar=False,
                                           normalize_embeddings=True).astype("float32")
             temporary = shard_dir / f"part_{b:05d}.tmp.npy"
             np.save(temporary, vector)
