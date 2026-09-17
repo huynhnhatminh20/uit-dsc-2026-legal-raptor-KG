@@ -53,7 +53,13 @@ def _fingerprint(context_dir: str) -> str:
         h.update(path.name.encode())
         h.update(str(stat.st_size).encode())
         h.update(str(stat.st_mtime_ns).encode())
-    h.update(f"{EMBED_MODEL}|{SEGMENT_CHARS}|{SEGMENT_OVERLAP}|cap{MAX_SEGMENTS_PER_DOCUMENT}|ivf{IVF_NPROBE}".encode())
+    # NOTE: IVF_NPROBE is deliberately excluded here. It is a query-time-only
+    # search parameter (how many IVF lists to probe); it does not affect the
+    # segments, embeddings, or the trained/stored FAISS index. Including it in
+    # the fingerprint used to force a full rebuild (re-segment + re-encode all
+    # embeddings from scratch) every time nprobe was tuned for recall, even
+    # though `self.index.nprobe = ...` already re-applies it correctly on load.
+    h.update(f"{EMBED_MODEL}|{SEGMENT_CHARS}|{SEGMENT_OVERLAP}|cap{MAX_SEGMENTS_PER_DOCUMENT}".encode())
     return h.hexdigest()[:20]
 
 
